@@ -290,7 +290,7 @@ impl PrimitiveEncode for f16 {
     }
 }
 
-struct PrimitiveEncoder<N: PrimitiveEncode> {
+pub struct PrimitiveEncoder<N: PrimitiveEncode> {
     values: ScalarBuffer<N>,
     buffer: N::Buffer,
 }
@@ -310,7 +310,7 @@ impl<N: PrimitiveEncode> Encoder for PrimitiveEncoder<N> {
     }
 }
 
-struct BooleanEncoder<'a>(&'a BooleanArray);
+pub struct BooleanEncoder<'a>(&'a BooleanArray);
 
 impl Encoder for BooleanEncoder<'_> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
@@ -321,7 +321,7 @@ impl Encoder for BooleanEncoder<'_> {
     }
 }
 
-struct StringEncoder<'a, O: OffsetSizeTrait>(&'a GenericStringArray<O>);
+pub struct StringEncoder<'a, O: OffsetSizeTrait>(&'a GenericStringArray<O>);
 
 impl<O: OffsetSizeTrait> Encoder for StringEncoder<'_, O> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
@@ -329,7 +329,7 @@ impl<O: OffsetSizeTrait> Encoder for StringEncoder<'_, O> {
     }
 }
 
-struct StringViewEncoder<'a>(&'a StringViewArray);
+pub struct StringViewEncoder<'a>(&'a StringViewArray);
 
 impl Encoder for StringViewEncoder<'_> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
@@ -337,7 +337,7 @@ impl Encoder for StringViewEncoder<'_> {
     }
 }
 
-struct ListEncoder<'a, O: OffsetSizeTrait> {
+pub struct ListEncoder<'a, O: OffsetSizeTrait> {
     offsets: OffsetBuffer<O>,
     nulls: Option<NullBuffer>,
     encoder: Box<dyn Encoder + 'a>,
@@ -383,7 +383,7 @@ impl<O: OffsetSizeTrait> Encoder for ListEncoder<'_, O> {
     }
 }
 
-struct FixedSizeListEncoder<'a> {
+pub struct FixedSizeListEncoder<'a> {
     value_length: usize,
     nulls: Option<NullBuffer>,
     encoder: Box<dyn Encoder + 'a>,
@@ -430,7 +430,7 @@ impl Encoder for FixedSizeListEncoder<'_> {
     }
 }
 
-struct DictionaryEncoder<'a, K: ArrowDictionaryKeyType> {
+pub struct DictionaryEncoder<'a, K: ArrowDictionaryKeyType> {
     keys: ScalarBuffer<K::Native>,
     encoder: Box<dyn Encoder + 'a>,
 }
@@ -466,7 +466,7 @@ impl Encoder for ArrayFormatter<'_> {
 }
 
 /// A newtype wrapper around [`ArrayFormatter`] that skips surrounding the value with `"`
-struct RawArrayFormatter<'a>(ArrayFormatter<'a>);
+pub struct RawArrayFormatter<'a>(ArrayFormatter<'a>);
 
 impl Encoder for RawArrayFormatter<'_> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
@@ -474,7 +474,7 @@ impl Encoder for RawArrayFormatter<'_> {
     }
 }
 
-struct NullEncoder;
+pub struct NullEncoder;
 
 impl Encoder for NullEncoder {
     fn encode(&mut self, _idx: usize, _out: &mut Vec<u8>) {
@@ -482,7 +482,7 @@ impl Encoder for NullEncoder {
     }
 }
 
-struct MapEncoder<'a> {
+pub struct MapEncoder<'a> {
     offsets: OffsetBuffer<i32>,
     keys: Box<dyn Encoder + 'a>,
     values: Box<dyn Encoder + 'a>,
@@ -561,7 +561,7 @@ impl Encoder for MapEncoder<'_> {
 
 /// New-type wrapper for encoding the binary types in arrow: `Binary`, `LargeBinary`
 /// and `FixedSizeBinary` as hex strings in JSON.
-struct BinaryEncoder<B>(B);
+pub struct BinaryEncoder<B>(B);
 
 impl<'a, B> BinaryEncoder<B>
 where
