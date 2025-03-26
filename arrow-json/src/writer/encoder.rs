@@ -166,13 +166,13 @@ fn encode_string(s: &str, out: &mut Vec<u8>) {
     serializer.serialize_str(s).unwrap();
 }
 
-struct FieldEncoder<'a> {
+pub struct FieldEncoder<'a> {
     field: FieldRef,
     encoder: Box<dyn Encoder + 'a>,
     nulls: Option<NullBuffer>,
 }
 
-struct StructArrayEncoder<'a> {
+pub struct StructArrayEncoder<'a> {
     encoders: Vec<FieldEncoder<'a>>,
     explicit_nulls: bool,
     struct_mode: StructMode,
