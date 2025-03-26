@@ -104,7 +104,7 @@
 //!     serde_json::json!({"a": 2}),
 //! );
 //! ```
-mod encoder;
+pub mod encoder;
 
 use std::{fmt::Debug, io::Write};
 
@@ -112,7 +112,7 @@ use crate::StructMode;
 use arrow_array::*;
 use arrow_schema::*;
 
-use encoder::{make_encoder, EncoderOptions};
+pub use encoder::{make_encoder, EncoderOptions};
 
 /// This trait defines how to format a sequence of JSON objects to a
 /// byte stream.
