@@ -296,7 +296,7 @@ pub struct PrimitiveEncoder<N: PrimitiveEncode> {
 }
 
 impl<N: PrimitiveEncode> PrimitiveEncoder<N> {
-    fn new<P: ArrowPrimitiveType<Native = N>>(array: &PrimitiveArray<P>) -> Self {
+    pub fn new<P: ArrowPrimitiveType<Native = N>>(array: &PrimitiveArray<P>) -> Self {
         Self {
             values: array.values().clone(),
             buffer: N::init_buffer(),
@@ -344,7 +344,7 @@ pub struct ListEncoder<'a, O: OffsetSizeTrait> {
 }
 
 impl<'a, O: OffsetSizeTrait> ListEncoder<'a, O> {
-    fn try_new(
+    pub fn try_new(
         array: &'a GenericListArray<O>,
         options: &EncoderOptions,
     ) -> Result<Self, ArrowError> {
@@ -390,7 +390,7 @@ pub struct FixedSizeListEncoder<'a> {
 }
 
 impl<'a> FixedSizeListEncoder<'a> {
-    fn try_new(
+    pub fn try_new(
         array: &'a FixedSizeListArray,
         options: &EncoderOptions,
     ) -> Result<Self, ArrowError> {
@@ -436,7 +436,7 @@ pub struct DictionaryEncoder<'a, K: ArrowDictionaryKeyType> {
 }
 
 impl<'a, K: ArrowDictionaryKeyType> DictionaryEncoder<'a, K> {
-    fn try_new(
+    pub fn try_new(
         array: &'a DictionaryArray<K>,
         options: &EncoderOptions,
     ) -> Result<Self, ArrowError> {
@@ -491,7 +491,7 @@ pub struct MapEncoder<'a> {
 }
 
 impl<'a> MapEncoder<'a> {
-    fn try_new(array: &'a MapArray, options: &EncoderOptions) -> Result<Self, ArrowError> {
+    pub fn try_new(array: &'a MapArray, options: &EncoderOptions) -> Result<Self, ArrowError> {
         let values = array.values();
         let keys = array.keys();
 
@@ -567,7 +567,7 @@ impl<'a, B> BinaryEncoder<B>
 where
     B: ArrayAccessor<Item = &'a [u8]>,
 {
-    fn new(array: B) -> Self {
+    pub fn new(array: B) -> Self {
         Self(array)
     }
 }
