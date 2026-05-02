@@ -1146,7 +1146,7 @@ impl ArrowColumnWriterFactory {
             let page_writer = self.create_page_writer(desc, out.len())?;
             let chunk = page_writer.buffer.clone();
             let writer = get_column_writer(desc.clone(), props.clone(), page_writer);
-            let hll = (props.estimate_distinct_count()
+            let hll = (props.estimate_int64_distinct_count()
                 && desc.physical_type() == PhysicalType::INT64)
                 .then(HyperLogLog::new);
             Ok(ArrowColumnWriter {
@@ -4990,14 +4990,14 @@ mod tests {
     }
 
     #[test]
-    fn estimate_distinct_count_int64() {
+    fn estimate_int64_distinct_count_int64() {
         let n_distinct: i64 = 10_000;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let values: Int64Array = (0..n_distinct).collect();
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
 
         let props = WriterProperties::builder()
-            .set_estimate_distinct_count(true)
+            .set_estimate_int64_distinct_count(true)
             .build();
         let buffer = write_to_buffer(&batch, props);
 
@@ -5012,7 +5012,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_distinct_count_disabled_by_default() {
+    fn estimate_int64_distinct_count_disabled_by_default() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let values: Int64Array = (0..1_000_i64).collect();
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
@@ -5022,7 +5022,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_distinct_count_only_int64() {
+    fn estimate_int64_distinct_count_only_int64() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("i32", DataType::Int32, false),
             Field::new("i64", DataType::Int64, false),
@@ -5036,7 +5036,7 @@ mod tests {
         .unwrap();
 
         let props = WriterProperties::builder()
-            .set_estimate_distinct_count(true)
+            .set_estimate_int64_distinct_count(true)
             .build();
         let buffer = write_to_buffer(&batch, props);
 
