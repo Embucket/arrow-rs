@@ -66,11 +66,7 @@ impl HyperLogLog {
         const M_F: f64 = M as f64;
         const ALPHA: f64 = 0.7213 / (1.0 + 1.079 / M_F);
 
-        let z: f64 = self
-            .registers
-            .iter()
-            .map(|&r| (-(r as f64)).exp2())
-            .sum();
+        let z: f64 = self.registers.iter().map(|&r| (-(r as f64)).exp2()).sum();
         let raw = ALPHA * M_F * M_F / z;
 
         let zeros = self.registers.iter().filter(|&&r| r == 0).count();
