@@ -16,36 +16,50 @@ const HLL_HASH_SEED: u64 = 0;
 /// HyperLogLog sketch with `m = 256` registers (precision `p = 8`).
 ///
 /// Each `Int64` value inserted is hashed with xxHash64; the top 8 bits select
-/// the register and the remaining 56 bits contribute their leading-zero count.
-/// Each register tracks the maximum leading-zero count observed for its bucket,
-/// and [`count`](Self::count) derives a cardinality estimate from those values.
+/// the register and the remaining 56 bits contribute their *rank* — the
+/// 1-indexed position of the leftmost 1-bit, i.e. `leading_zeros + 1`. Each
+/// register tracks the maximum rank observed for its bucket, and
+/// [`count`](Self::count) derives a cardinality estimate from those values.
 pub struct HyperLogLog {
     registers: [u8; 256],
 }
 
+impl Default for HyperLogLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HyperLogLog {
+    /// Create an empty sketch with all registers set to zero.
+    pub fn new() -> Self {
+        Self {
+            registers: [0; 256],
+        }
+    }
+
     /// Insert every non-null value of `array` (must be `Int64`) into the sketch.
     ///
     /// Each value is hashed once; for every register `i` the new maximum
-    /// leading-zero count among hashes routed to bucket `i` is merged into
-    /// `registers[i]`. Returns an error if `array` is not an `Int64Array` or if
-    /// the underlying Arrow compute kernels fail.
+    /// rank among hashes routed to bucket `i` is merged into `registers[i]`.
+    /// Returns an error if `array` is not an `Int64Array` or if the underlying
+    /// Arrow compute kernels fail.
     pub fn insert_array(&mut self, array: ArrayRef) -> Result<(), ParquetError> {
         let array: &PrimitiveArray<Int64Type> = as_primitive_array(&array);
         let hashes: PrimitiveArray<UInt64Type> =
             array.unary(|v| XxHash64::oneshot(HLL_HASH_SEED, &v.to_le_bytes()));
         let indices: UInt8Array = hashes.unary(|h| (h >> 56) as u8);
-        let leading_zeros: UInt8Array = hashes.unary(|h| (h << 8).leading_zeros() as u8);
+        let ranks: UInt8Array = hashes.unary(|h| (h << 8).leading_zeros() as u8 + 1);
 
         for i in 0..=255u8 {
             let scalar = UInt8Array::new_scalar(i);
             let mask = arrow_ord::cmp::eq(&indices, &scalar)?;
-            let filtered = arrow_select::filter::filter(&leading_zeros, &mask)?;
+            let filtered = arrow_select::filter::filter(&ranks, &mask)?;
             let filtered: &PrimitiveArray<UInt8Type> = as_primitive_array(&filtered);
-            if let Some(max_lz) = arrow_arith::aggregate::max(filtered) {
+            if let Some(max_rank) = arrow_arith::aggregate::max(filtered) {
                 let register = &mut self.registers[i as usize];
-                if max_lz > *register {
-                    *register = max_lz;
+                if max_rank > *register {
+                    *register = max_rank;
                 }
             }
         }
