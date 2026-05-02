@@ -5029,11 +5029,8 @@ mod tests {
         ]));
         let i32_values = Int32Array::from((0..500).collect::<Vec<_>>());
         let i64_values: Int64Array = (0..500_i64).collect();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(i32_values), Arc::new(i64_values)],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(i32_values), Arc::new(i64_values)]).unwrap();
 
         let props = WriterProperties::builder()
             .set_estimate_int64_distinct_count(true)
