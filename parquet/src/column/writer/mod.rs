@@ -419,6 +419,20 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         }
     }
 
+    /// Override the `distinct_count` value that will be written into this
+    /// column chunk's statistics.
+    ///
+    /// Normally [`Self::write_batch_with_statistics`] only honors a
+    /// `distinct_count` argument on the very first batch written to a chunk,
+    /// and clears it on subsequent writes. This setter writes the given value
+    /// directly into the chunk's accumulated metrics so callers that compute
+    /// the count externally (for example via a HyperLogLog sketch fed by every
+    /// batch) can install the final value at any point before
+    /// [`Self::close`].
+    pub fn set_column_distinct_count(&mut self, count: Option<u64>) {
+        self.column_metrics.column_distinct_count = count;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_batch_internal(
         &mut self,
