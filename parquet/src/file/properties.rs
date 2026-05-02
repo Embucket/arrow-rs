@@ -73,8 +73,8 @@ pub const DEFAULT_CDC_MIN_CHUNK_SIZE: usize = 256 * 1024;
 pub const DEFAULT_CDC_MAX_CHUNK_SIZE: usize = 1024 * 1024;
 /// Default normalization level for content-defined chunking.
 pub const DEFAULT_CDC_NORM_LEVEL: i32 = 0;
-/// Default value for [`WriterProperties::estimate_distinct_count`]
-pub const DEFAULT_ESTIMATE_DISTINCT_COUNT: bool = false;
+/// Default value for [`WriterProperties::estimate_int64_distinct_count`]
+pub const DEFAULT_ESTIMATE_INT64_DISTINCT_COUNT: bool = false;
 
 /// EXPERIMENTAL: Options for content-defined chunking (CDC).
 ///
@@ -252,7 +252,7 @@ pub struct WriterProperties {
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
     content_defined_chunking: Option<CdcOptions>,
-    estimate_distinct_count: bool,
+    estimate_int64_distinct_count: bool,
     #[cfg(feature = "encryption")]
     pub(crate) file_encryption_properties: Option<Arc<FileEncryptionProperties>>,
 }
@@ -449,9 +449,9 @@ impl WriterProperties {
     /// statistic for `Int64` columns using a HyperLogLog estimate.
     ///
     /// For more details see
-    /// [`WriterPropertiesBuilder::set_estimate_distinct_count`].
-    pub fn estimate_distinct_count(&self) -> bool {
-        self.estimate_distinct_count
+    /// [`WriterPropertiesBuilder::set_estimate_int64_distinct_count`].
+    pub fn estimate_int64_distinct_count(&self) -> bool {
+        self.estimate_int64_distinct_count
     }
 
     /// Returns encoding for a data page, when dictionary encoding is enabled.
@@ -578,7 +578,7 @@ pub struct WriterPropertiesBuilder {
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
     content_defined_chunking: Option<CdcOptions>,
-    estimate_distinct_count: bool,
+    estimate_int64_distinct_count: bool,
     #[cfg(feature = "encryption")]
     file_encryption_properties: Option<Arc<FileEncryptionProperties>>,
 }
@@ -603,7 +603,7 @@ impl Default for WriterPropertiesBuilder {
             statistics_truncate_length: DEFAULT_STATISTICS_TRUNCATE_LENGTH,
             coerce_types: DEFAULT_COERCE_TYPES,
             content_defined_chunking: None,
-            estimate_distinct_count: DEFAULT_ESTIMATE_DISTINCT_COUNT,
+            estimate_int64_distinct_count: DEFAULT_ESTIMATE_INT64_DISTINCT_COUNT,
             #[cfg(feature = "encryption")]
             file_encryption_properties: None,
         }
@@ -658,7 +658,7 @@ impl WriterPropertiesBuilder {
             statistics_truncate_length: self.statistics_truncate_length,
             coerce_types: self.coerce_types,
             content_defined_chunking: self.content_defined_chunking,
-            estimate_distinct_count: self.estimate_distinct_count,
+            estimate_int64_distinct_count: self.estimate_int64_distinct_count,
             #[cfg(feature = "encryption")]
             file_encryption_properties: self.file_encryption_properties,
         }
@@ -904,8 +904,8 @@ impl WriterPropertiesBuilder {
         self.content_defined_chunking = options;
         self
     }
-    /// columns (defaults to `false` via [`DEFAULT_ESTIMATE_DISTINCT_COUNT`]).
     /// Enable HyperLogLog-based `distinct_count` estimation for `Int64`
+    /// columns (defaults to `false` via [`DEFAULT_ESTIMATE_INT64_DISTINCT_COUNT`]).
     ///
     /// When enabled, the arrow writer feeds every `Int64` array routed to a
     /// column chunk into a HyperLogLog sketch (m=256, p=8) and stores
@@ -914,8 +914,8 @@ impl WriterPropertiesBuilder {
     /// count must not rely on it.
     ///
     /// Has no effect on non-`Int64` columns.
-    pub fn set_estimate_distinct_count(mut self, value: bool) -> Self {
-        self.estimate_distinct_count = value;
+    pub fn set_estimate_int64_distinct_count(mut self, value: bool) -> Self {
+        self.estimate_int64_distinct_count = value;
         self
     }
 
@@ -1211,7 +1211,7 @@ impl From<WriterProperties> for WriterPropertiesBuilder {
             statistics_truncate_length: props.statistics_truncate_length,
             coerce_types: props.coerce_types,
             content_defined_chunking: props.content_defined_chunking,
-            estimate_distinct_count: props.estimate_distinct_count,
+            estimate_int64_distinct_count: props.estimate_int64_distinct_count,
             #[cfg(feature = "encryption")]
             file_encryption_properties: props.file_encryption_properties,
         }
