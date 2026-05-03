@@ -37,6 +37,30 @@ use crate::arrow::ArrowSchemaConverter;
 use crate::arrow::arrow_writer::byte_array::ByteArrayEncoder;
 use crate::arrow::hll::HyperLogLog;
 use crate::basic::Type as PhysicalType;
+
+/// File-level KV metadata key that opts in to HyperLogLog-based `distinct_count`
+/// estimation for `Int64` columns. When `WriterProperties::key_value_metadata()`
+/// contains an entry with this key whose value is `"true"`, the arrow writer
+/// feeds every `Int64` array routed to a column chunk into a HyperLogLog sketch
+/// (m=256, p=8) and stores the estimate in the chunk's `distinct_count`
+/// statistic. The estimate has a standard error of roughly 6.5%; consumers that
+/// require an exact count must not rely on it.
+///
+/// Has no effect on non-`Int64` columns.
+const ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY: &str =
+    "iceberg.estimate-int64-distinct-count";
+
+fn estimate_int64_distinct_count_enabled(props: &WriterProperties) -> bool {
+    props
+        .key_value_metadata()
+        .map(|kv| {
+            kv.iter().any(|entry| {
+                entry.key == ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY
+                    && entry.value.as_deref() == Some("true")
+            })
+        })
+        .unwrap_or(false)
+}
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
 use crate::column::writer::encoder::ColumnValueEncoder;
@@ -1146,7 +1170,7 @@ impl ArrowColumnWriterFactory {
             let page_writer = self.create_page_writer(desc, out.len())?;
             let chunk = page_writer.buffer.clone();
             let writer = get_column_writer(desc.clone(), props.clone(), page_writer);
-            let hll = (props.estimate_int64_distinct_count()
+            let hll = (estimate_int64_distinct_count_enabled(props)
                 && desc.physical_type() == PhysicalType::INT64)
                 .then(HyperLogLog::new);
             Ok(ArrowColumnWriter {
@@ -4989,6 +5013,15 @@ mod tests {
         buffer
     }
 
+    fn estimate_int64_distinct_count_props() -> WriterProperties {
+        WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY.to_owned(),
+                "true".to_owned(),
+            )]))
+            .build()
+    }
+
     #[test]
     fn estimate_int64_distinct_count_int64() {
         let n_distinct: i64 = 10_000;
@@ -4996,10 +5029,7 @@ mod tests {
         let values: Int64Array = (0..n_distinct).collect();
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
 
-        let props = WriterProperties::builder()
-            .set_estimate_int64_distinct_count(true)
-            .build();
-        let buffer = write_to_buffer(&batch, props);
+        let buffer = write_to_buffer(&batch, estimate_int64_distinct_count_props());
 
         let count = distinct_count_from_buffer(buffer, 0).expect("distinct_count populated");
         let n = n_distinct as u64;
@@ -5032,10 +5062,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(i32_values), Arc::new(i64_values)]).unwrap();
 
-        let props = WriterProperties::builder()
-            .set_estimate_int64_distinct_count(true)
-            .build();
-        let buffer = write_to_buffer(&batch, props);
+        let buffer = write_to_buffer(&batch, estimate_int64_distinct_count_props());
 
         assert_eq!(distinct_count_from_buffer(buffer.clone(), 0), None);
         assert!(distinct_count_from_buffer(buffer, 1).is_some());

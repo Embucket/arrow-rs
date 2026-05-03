@@ -61,8 +61,6 @@ pub const DEFAULT_STATISTICS_TRUNCATE_LENGTH: Option<usize> = Some(64);
 pub const DEFAULT_OFFSET_INDEX_DISABLED: bool = false;
 /// Default values for [`WriterProperties::coerce_types`]
 pub const DEFAULT_COERCE_TYPES: bool = false;
-/// Default value for [`WriterProperties::estimate_int64_distinct_count`]
-pub const DEFAULT_ESTIMATE_INT64_DISTINCT_COUNT: bool = false;
 
 /// Parquet writer version.
 ///
@@ -170,7 +168,6 @@ pub struct WriterProperties {
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
-    estimate_int64_distinct_count: bool,
     #[cfg(feature = "encryption")]
     pub(crate) file_encryption_properties: Option<Arc<FileEncryptionProperties>>,
 }
@@ -367,15 +364,6 @@ impl WriterProperties {
         self.coerce_types
     }
 
-    /// Returns `true` if the writer should populate the `distinct_count`
-    /// statistic for `Int64` columns using a HyperLogLog estimate.
-    ///
-    /// For more details see
-    /// [`WriterPropertiesBuilder::set_estimate_int64_distinct_count`].
-    pub fn estimate_int64_distinct_count(&self) -> bool {
-        self.estimate_int64_distinct_count
-    }
-
     /// Returns encoding for a data page, when dictionary encoding is enabled.
     ///
     /// This is not configurable.
@@ -499,7 +487,6 @@ pub struct WriterPropertiesBuilder {
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
     coerce_types: bool,
-    estimate_int64_distinct_count: bool,
     #[cfg(feature = "encryption")]
     file_encryption_properties: Option<Arc<FileEncryptionProperties>>,
 }
@@ -523,7 +510,6 @@ impl Default for WriterPropertiesBuilder {
             column_index_truncate_length: DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH,
             statistics_truncate_length: DEFAULT_STATISTICS_TRUNCATE_LENGTH,
             coerce_types: DEFAULT_COERCE_TYPES,
-            estimate_int64_distinct_count: DEFAULT_ESTIMATE_INT64_DISTINCT_COUNT,
             #[cfg(feature = "encryption")]
             file_encryption_properties: None,
         }
@@ -549,7 +535,6 @@ impl WriterPropertiesBuilder {
             column_index_truncate_length: self.column_index_truncate_length,
             statistics_truncate_length: self.statistics_truncate_length,
             coerce_types: self.coerce_types,
-            estimate_int64_distinct_count: self.estimate_int64_distinct_count,
             #[cfg(feature = "encryption")]
             file_encryption_properties: self.file_encryption_properties,
         }
@@ -762,21 +747,6 @@ impl WriterPropertiesBuilder {
     /// [`ArrowToParquetSchemaConverter::with_coerce_types`]: crate::arrow::ArrowSchemaConverter::with_coerce_types
     pub fn set_coerce_types(mut self, coerce_types: bool) -> Self {
         self.coerce_types = coerce_types;
-        self
-    }
-
-    /// Enable HyperLogLog-based `distinct_count` estimation for `Int64`
-    /// columns (defaults to `false` via [`DEFAULT_ESTIMATE_INT64_DISTINCT_COUNT`]).
-    ///
-    /// When enabled, the arrow writer feeds every `Int64` array routed to a
-    /// column chunk into a HyperLogLog sketch (m=256, p=8) and stores
-    /// `count() as u64` as the chunk's `distinct_count` statistic. The estimate
-    /// has a standard error of roughly 6.5%; consumers that require an exact
-    /// count must not rely on it.
-    ///
-    /// Has no effect on non-`Int64` columns.
-    pub fn set_estimate_int64_distinct_count(mut self, value: bool) -> Self {
-        self.estimate_int64_distinct_count = value;
         self
     }
 
@@ -1063,7 +1033,6 @@ impl From<WriterProperties> for WriterPropertiesBuilder {
             column_index_truncate_length: props.column_index_truncate_length,
             statistics_truncate_length: props.statistics_truncate_length,
             coerce_types: props.coerce_types,
-            estimate_int64_distinct_count: props.estimate_int64_distinct_count,
             #[cfg(feature = "encryption")]
             file_encryption_properties: props.file_encryption_properties,
         }
