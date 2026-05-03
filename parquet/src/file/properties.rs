@@ -904,6 +904,7 @@ impl WriterPropertiesBuilder {
         self.content_defined_chunking = options;
         self
     }
+
     /// Enable HyperLogLog-based `distinct_count` estimation for `Int64`
     /// columns (defaults to `false` via [`DEFAULT_ESTIMATE_INT64_DISTINCT_COUNT`]).
     ///
