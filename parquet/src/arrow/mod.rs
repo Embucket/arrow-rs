@@ -185,6 +185,8 @@ pub mod arrow_writer;
 mod buffer;
 mod decoder;
 
+pub mod hll;
+
 #[cfg(feature = "async")]
 pub mod async_reader;
 #[cfg(feature = "async")]

@@ -35,6 +35,32 @@ use super::schema::{add_encoded_arrow_schema_to_metadata, decimal_length_from_pr
 
 use crate::arrow::ArrowSchemaConverter;
 use crate::arrow::arrow_writer::byte_array::ByteArrayEncoder;
+use crate::arrow::hll::HyperLogLog;
+use crate::basic::Type as PhysicalType;
+
+/// File-level KV metadata key that opts in to HyperLogLog-based `distinct_count`
+/// estimation for `Int64` columns. When `WriterProperties::key_value_metadata()`
+/// contains an entry with this key whose value is `"true"`, the arrow writer
+/// feeds every `Int64` array routed to a column chunk into a HyperLogLog sketch
+/// (m=256, p=8) and stores the estimate in the chunk's `distinct_count`
+/// statistic. The estimate has a standard error of roughly 6.5%; consumers that
+/// require an exact count must not rely on it.
+///
+/// Has no effect on non-`Int64` columns.
+const ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY: &str =
+    "iceberg.estimate-int64-distinct-count";
+
+fn estimate_int64_distinct_count_enabled(props: &WriterProperties) -> bool {
+    props
+        .key_value_metadata()
+        .map(|kv| {
+            kv.iter().any(|entry| {
+                entry.key == ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY
+                    && entry.value.as_deref() == Some("true")
+            })
+        })
+        .unwrap_or(false)
+}
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
 use crate::column::writer::encoder::ColumnValueEncoder;
@@ -863,14 +889,17 @@ impl std::fmt::Debug for ArrowColumnWriter {
 
 enum ArrowColumnWriterImpl {
     ByteArray(GenericColumnWriter<'static, ByteArrayEncoder>),
-    Column(ColumnWriter<'static>),
+    Column(ColumnWriter<'static>, Option<HyperLogLog>),
 }
 
 impl ArrowColumnWriter {
     /// Write an [`ArrowLeafColumn`]
     pub fn write(&mut self, col: &ArrowLeafColumn) -> Result<()> {
         match &mut self.writer {
-            ArrowColumnWriterImpl::Column(c) => {
+            ArrowColumnWriterImpl::Column(c, hll) => {
+                if let Some(hll) = hll.as_mut() {
+                    hll.insert_array(col.0.array().clone())?;
+                }
                 let leaf = col.0.array();
                 match leaf.as_any_dictionary_opt() {
                     Some(dictionary) => {
@@ -892,7 +921,14 @@ impl ArrowColumnWriter {
     pub fn close(self) -> Result<ArrowColumnChunk> {
         let close = match self.writer {
             ArrowColumnWriterImpl::ByteArray(c) => c.close()?,
-            ArrowColumnWriterImpl::Column(c) => c.close()?,
+            ArrowColumnWriterImpl::Column(mut c, hll) => {
+                if let Some(hll) = hll {
+                    if let ColumnWriter::Int64ColumnWriter(int64) = &mut c {
+                        int64.set_column_distinct_count(Some(hll.count() as u64));
+                    }
+                }
+                c.close()?
+            }
         };
         let chunk = Arc::try_unwrap(self.chunk).ok().unwrap();
         let data = chunk.into_inner().unwrap();
@@ -912,7 +948,7 @@ impl ArrowColumnWriter {
     pub fn memory_size(&self) -> usize {
         match &self.writer {
             ArrowColumnWriterImpl::ByteArray(c) => c.memory_size(),
-            ArrowColumnWriterImpl::Column(c) => c.memory_size(),
+            ArrowColumnWriterImpl::Column(c, _) => c.memory_size(),
         }
     }
 
@@ -926,7 +962,7 @@ impl ArrowColumnWriter {
     pub fn get_estimated_total_bytes(&self) -> usize {
         match &self.writer {
             ArrowColumnWriterImpl::ByteArray(c) => c.get_estimated_total_bytes() as _,
-            ArrowColumnWriterImpl::Column(c) => c.get_estimated_total_bytes() as _,
+            ArrowColumnWriterImpl::Column(c, _) => c.get_estimated_total_bytes() as _,
         }
     }
 }
@@ -1134,9 +1170,12 @@ impl ArrowColumnWriterFactory {
             let page_writer = self.create_page_writer(desc, out.len())?;
             let chunk = page_writer.buffer.clone();
             let writer = get_column_writer(desc.clone(), props.clone(), page_writer);
+            let hll = (estimate_int64_distinct_count_enabled(props)
+                && desc.physical_type() == PhysicalType::INT64)
+                .then(HyperLogLog::new);
             Ok(ArrowColumnWriter {
                 chunk,
-                writer: ArrowColumnWriterImpl::Column(writer),
+                writer: ArrowColumnWriterImpl::Column(writer, hll),
             })
         };
 
@@ -4954,5 +4993,78 @@ mod tests {
 
         let total_rows: i64 = sizes.iter().sum();
         assert_eq!(total_rows, 100, "Total rows should be preserved");
+    }
+
+    fn distinct_count_from_buffer(buffer: Vec<u8>, column: usize) -> Option<u64> {
+        let reader = SerializedFileReader::new(Bytes::from(buffer)).unwrap();
+        reader
+            .metadata()
+            .row_group(0)
+            .column(column)
+            .statistics()
+            .and_then(|s| s.distinct_count_opt())
+    }
+
+    fn write_to_buffer(batch: &RecordBatch, props: WriterProperties) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), Some(props)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        buffer
+    }
+
+    fn estimate_int64_distinct_count_props() -> WriterProperties {
+        WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY.to_owned(),
+                "true".to_owned(),
+            )]))
+            .build()
+    }
+
+    #[test]
+    fn estimate_int64_distinct_count_int64() {
+        let n_distinct: i64 = 10_000;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let values: Int64Array = (0..n_distinct).collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+
+        let buffer = write_to_buffer(&batch, estimate_int64_distinct_count_props());
+
+        let count = distinct_count_from_buffer(buffer, 0).expect("distinct_count populated");
+        let n = n_distinct as u64;
+        let lower = n - n / 10;
+        let upper = n + n / 10;
+        assert!(
+            count >= lower && count <= upper,
+            "HLL estimate {count} not within ±10% of {n}",
+        );
+    }
+
+    #[test]
+    fn estimate_int64_distinct_count_disabled_by_default() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let values: Int64Array = (0..1_000_i64).collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+
+        let buffer = write_to_buffer(&batch, WriterProperties::builder().build());
+        assert_eq!(distinct_count_from_buffer(buffer, 0), None);
+    }
+
+    #[test]
+    fn estimate_int64_distinct_count_only_int64() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i32", DataType::Int32, false),
+            Field::new("i64", DataType::Int64, false),
+        ]));
+        let i32_values = Int32Array::from((0..500).collect::<Vec<_>>());
+        let i64_values: Int64Array = (0..500_i64).collect();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(i32_values), Arc::new(i64_values)]).unwrap();
+
+        let buffer = write_to_buffer(&batch, estimate_int64_distinct_count_props());
+
+        assert_eq!(distinct_count_from_buffer(buffer.clone(), 0), None);
+        assert!(distinct_count_from_buffer(buffer, 1).is_some());
     }
 }
