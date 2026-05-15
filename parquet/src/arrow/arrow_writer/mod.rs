@@ -957,7 +957,7 @@ impl ArrowColumnWriter {
             // Add a page break after each chunk except the last
             if i + 1 < num_chunks {
                 match &mut self.writer {
-                    ArrowColumnWriterImpl::Column(c) => c.add_data_page()?,
+                    ArrowColumnWriterImpl::Column(c, _) => c.add_data_page()?,
                     ArrowColumnWriterImpl::ByteArray(c) => c.add_data_page()?,
                 }
             }
