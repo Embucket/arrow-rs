@@ -853,16 +853,10 @@ where
         // for the skip_buffer doesn't allow stack allocation and leads to a significant
         // drop in performance. We'll settle for erroring out here and come up with a
         // better fix if writers ever start getting creative with block sizes.
-        let mini_block_batch_size = match self.values_per_mini_block {
-            32 => 32,
-            64 => 64,
-            _ => {
-                return Err(general_err!(
-                    "cannot skip miniblock of size {}",
-                    self.values_per_mini_block
-                ));
-            }
-        };
+        // Embucket: the skip buffer is heap-allocated anyway, so size it from the header's
+        // values_per_mini_block instead of refusing anything but 32/64 — Snowflake-written
+        // files use other mini-block sizes, which made every row-filter (pushdown) skip fail.
+        let mini_block_batch_size = self.values_per_mini_block;
 
         let mut skip_buffer = vec![T::T::default(); mini_block_batch_size];
         while skip < to_skip {
