@@ -849,16 +849,18 @@ where
 
         // See https://github.com/apache/arrow-rs/pull/9794.
         // The parquet spec actually allows for miniblock sizes other than 32 or 64, but
-        // no current writers use anything else. Using values_per_mini_block directly
-        // for the skip_buffer doesn't allow stack allocation and leads to a significant
-        // drop in performance. We'll settle for erroring out here and come up with a
-        // better fix if writers ever start getting creative with block sizes.
-        // Embucket: the skip buffer is heap-allocated anyway, so size it from the header's
-        // values_per_mini_block instead of refusing anything but 32/64 — Snowflake-written
-        // files use other mini-block sizes, which made every row-filter (pushdown) skip fail.
-        let mini_block_batch_size = self.values_per_mini_block;
+        // no current writers use anything else. Upstream sizes the skip buffer from the
+        // mini-block size (so it can live on the stack) and errors out on anything else.
+        // Embucket: Snowflake-written files use other mini-block sizes, which made every
+        // row-filter (pushdown) skip fail. Instead of refusing them — or sizing the buffer
+        // from `values_per_mini_block`, which comes straight from the page header (an
+        // unbounded ULEB128, so a malformed file could force an arbitrarily large
+        // allocation) — decode each mini-block through a fixed-size stack chunk. The
+        // buffer is therefore bounded and independent of the header, and any mini-block
+        // size that `set_data` accepts is handled without extra allocation.
+        const SKIP_CHUNK: usize = 64;
 
-        let mut skip_buffer = vec![T::T::default(); mini_block_batch_size];
+        let mut skip_buffer = [T::T::default(); SKIP_CHUNK];
         while skip < to_skip {
             if self.mini_block_remaining == 0 {
                 self.next_mini_block()?;
@@ -884,30 +886,38 @@ where
                 // bit_width=0 payloads occupy zero bytes; no bit_reader advancement needed.
             } else {
                 // bw>0: must decode to track last_value for subsequent get() calls.
-                let skip_count = self
-                    .bit_reader
-                    .get_batch(&mut skip_buffer[0..mini_block_to_skip], bit_width);
+                // Decode in SKIP_CHUNK-sized pieces; the bit reader is positional, so
+                // chunking does not change which bits are consumed.
+                let mut remaining_in_mini_block_to_skip = mini_block_to_skip;
+                while remaining_in_mini_block_to_skip > 0 {
+                    let n = remaining_in_mini_block_to_skip.min(SKIP_CHUNK);
+                    let skip_count = self
+                        .bit_reader
+                        .get_batch(&mut skip_buffer[0..n], bit_width);
 
-                if skip_count != mini_block_to_skip {
-                    return Err(general_err!(
-                        "Expected to skip {} values from mini block got {}.",
-                        mini_block_to_skip,
-                        skip_count
-                    ));
-                }
+                    if skip_count != n {
+                        return Err(general_err!(
+                            "Expected to skip {} values from mini block got {}.",
+                            n,
+                            skip_count
+                        ));
+                    }
 
-                if min_delta == 0 {
-                    for v in &mut skip_buffer[0..skip_count] {
-                        *v = v.wrapping_add(&self.last_value);
-                        self.last_value = *v;
+                    if min_delta == 0 {
+                        for v in &mut skip_buffer[0..skip_count] {
+                            *v = v.wrapping_add(&self.last_value);
+                            self.last_value = *v;
+                        }
+                    } else {
+                        for v in &mut skip_buffer[0..skip_count] {
+                            *v = v
+                                .wrapping_add(&self.min_delta)
+                                .wrapping_add(&self.last_value);
+                            self.last_value = *v;
+                        }
                     }
-                } else {
-                    for v in &mut skip_buffer[0..skip_count] {
-                        *v = v
-                            .wrapping_add(&self.min_delta)
-                            .wrapping_add(&self.last_value);
-                        self.last_value = *v;
-                    }
+
+                    remaining_in_mini_block_to_skip -= skip_count;
                 }
             }
 
@@ -1806,6 +1816,246 @@ mod tests {
         let data: Vec<i64> = (0..128).map(|i| i * 100).collect();
         test_skip::<Int64Type>(data.clone(), Encoding::DELTA_BINARY_PACKED, 50);
         test_skip::<Int64Type>(data, Encoding::DELTA_BINARY_PACKED, 200);
+    }
+
+    /// Test-only DELTA_BINARY_PACKED encoder that, unlike [`DeltaBitPackEncoder`]
+    /// (which always writes 128 values per block in 4 mini-blocks), lets the test pick
+    /// `block_size` and `mini_blocks_per_block`. Snowflake-written files use other
+    /// mini-block sizes than the 32/64 the built-in encoder produces.
+    fn delta_bit_packed_encode_i64(
+        values: &[i64],
+        block_size: usize,
+        mini_blocks_per_block: usize,
+    ) -> Bytes {
+        use crate::util::bit_util::{num_required_bits, BitWriter};
+
+        assert_eq!(block_size % mini_blocks_per_block, 0);
+        let values_per_mini_block = block_size / mini_blocks_per_block;
+
+        let mut w = BitWriter::new(256);
+        w.put_vlq_int(block_size as u64);
+        w.put_vlq_int(mini_blocks_per_block as u64);
+        w.put_vlq_int(values.len() as u64);
+        w.put_zigzag_vlq_int(values.first().copied().unwrap_or(0));
+
+        let deltas: Vec<i64> = values.windows(2).map(|p| p[1].wrapping_sub(p[0])).collect();
+
+        for block in deltas.chunks(block_size) {
+            let min_delta = *block.iter().min().unwrap();
+            w.put_zigzag_vlq_int(min_delta);
+
+            let mini_blocks: Vec<&[i64]> = block.chunks(values_per_mini_block).collect();
+            let mut bit_widths = Vec::with_capacity(mini_blocks_per_block);
+            for i in 0..mini_blocks_per_block {
+                let bw = match mini_blocks.get(i) {
+                    Some(mb) => {
+                        let max = mb.iter().map(|d| d.wrapping_sub(min_delta) as u64).max();
+                        num_required_bits(max.unwrap_or(0)) as usize
+                    }
+                    // Trailing mini-blocks with no values: bit width is unspecified,
+                    // use a non-zero value to make sure the decoder ignores it.
+                    None => 0xFF,
+                };
+                bit_widths.push(bw);
+                w.put_aligned(bw as u8, 1);
+            }
+
+            for (i, mb) in mini_blocks.iter().enumerate() {
+                let bw = bit_widths[i];
+                for d in mb.iter() {
+                    w.put_value(d.wrapping_sub(min_delta) as u64, bw);
+                }
+                // Spec: the last mini-block is padded to a full mini-block.
+                for _ in mb.len()..values_per_mini_block {
+                    w.put_value(0, bw);
+                }
+            }
+        }
+
+        Bytes::from(w.consume())
+    }
+
+    /// Values with varying deltas so every mini-block gets a bit width > 0.
+    fn snowflake_like_values(n: usize) -> Vec<i64> {
+        let mut v = Vec::with_capacity(n);
+        let mut cur: i64 = -1234;
+        for i in 0..n as i64 {
+            v.push(cur);
+            // Deltas of mixed sign and magnitude, no repeating pattern within a mini-block.
+            cur = cur.wrapping_add((i * 37) % 101 - 50 + ((i % 7) * 1000));
+        }
+        v
+    }
+
+    /// Decode `bytes` (written by [`delta_bit_packed_encode_i64`]) with `skip` first
+    /// and compare the tail with `data[skip..]`; mirrors [`test_skip`].
+    fn check_custom_mini_block_skip(bytes: &Bytes, data: &[i64], skip: usize) {
+        let mut decoder = DeltaBitPackDecoder::<Int64Type>::new();
+        decoder
+            .set_data(bytes.clone(), data.len())
+            .expect("ok to set data");
+        assert_eq!(decoder.values_left(), data.len());
+
+        if skip >= data.len() {
+            assert_eq!(decoder.skip(skip).expect("ok to skip"), data.len());
+            assert_eq!(decoder.skip(skip).expect("ok to skip again"), 0);
+        } else {
+            assert_eq!(decoder.skip(skip).expect("ok to skip"), skip);
+            let expected = &data[skip..];
+            let mut buffer = vec![0i64; expected.len()];
+            let fetched = decoder.get(&mut buffer).expect("ok to decode");
+            assert_eq!(fetched, expected.len());
+            assert_eq!(&buffer, expected);
+            assert_eq!(decoder.values_left(), 0);
+        }
+    }
+
+    fn check_custom_mini_block_sizes(block_size: usize, mini_blocks_per_block: usize) {
+        let values_per_mini_block = block_size / mini_blocks_per_block;
+        let data = snowflake_like_values(3 * block_size + 77);
+        let bytes = delta_bit_packed_encode_i64(&data, block_size, mini_blocks_per_block);
+
+        // (i) plain decode, in several `get` calls of uneven size
+        let mut decoder = DeltaBitPackDecoder::<Int64Type>::new();
+        decoder
+            .set_data(bytes.clone(), data.len())
+            .expect("ok to set data");
+        let mut result = vec![0i64; data.len()];
+        let mut read = 0;
+        while decoder.values_left() > 0 {
+            let n = (data.len() - read).min(values_per_mini_block - 3);
+            read += decoder.get(&mut result[read..read + n]).expect("ok to decode");
+        }
+        assert_eq!(read, data.len());
+        assert_eq!(result, data);
+
+        // (ii) skip then get the tail — within a mini-block, across mini-block and block
+        // boundaries, larger than a mini-block / a block, and past the end.
+        let skips = [
+            1,
+            5,
+            100,
+            129,
+            300,
+            values_per_mini_block,
+            values_per_mini_block + 1,
+            2 * values_per_mini_block - 1,
+            block_size - 1,
+            block_size,
+            block_size + 1,
+            2 * block_size + 5,
+            data.len() - 1,
+            data.len(),
+            data.len() + 10,
+        ];
+        for skip in skips {
+            check_custom_mini_block_skip(&bytes, &data, skip);
+        }
+
+        // (iii) two consecutive partial skips inside the same mini-block, then get.
+        let mut decoder = DeltaBitPackDecoder::<Int64Type>::new();
+        decoder
+            .set_data(bytes.clone(), data.len())
+            .expect("ok to set data");
+        assert_eq!(decoder.skip(7).unwrap(), 7);
+        assert_eq!(decoder.skip(values_per_mini_block + 3).unwrap(), values_per_mini_block + 3);
+        let start = values_per_mini_block + 10;
+        let mut buffer = vec![0i64; data.len() - start];
+        assert_eq!(decoder.get(&mut buffer).unwrap(), buffer.len());
+        assert_eq!(&buffer, &data[start..]);
+    }
+
+    #[test]
+    fn test_delta_bit_packed_custom_encoder_matches_builtin_layout() {
+        // Sanity check for the test-only encoder: with the built-in 128/4 layout the
+        // decoder must read its output exactly like the built-in encoder's.
+        let data = snowflake_like_values(300);
+        let bytes = delta_bit_packed_encode_i64(&data, 128, 4);
+        check_custom_mini_block_skip(&bytes, &data, 0);
+        check_custom_mini_block_skip(&bytes, &data, 33);
+        check_custom_mini_block_skip(&bytes, &data, 200);
+    }
+
+    #[test]
+    fn test_skip_delta_bit_packed_mini_block_128() {
+        // Snowflake-like: 256 values per block in 2 mini-blocks of 128.
+        check_custom_mini_block_sizes(256, 2);
+    }
+
+    #[test]
+    fn test_skip_delta_bit_packed_mini_block_512() {
+        // A single mini-block of 512 values per block.
+        check_custom_mini_block_sizes(512, 1);
+    }
+
+    #[test]
+    fn test_skip_delta_bit_packed_mini_block_256_i32() {
+        // Also exercise the i32 decoder with a mini-block larger than the skip chunk.
+        let data: Vec<i32> = snowflake_like_values(1000)
+            .into_iter()
+            .map(|v| v as i32)
+            .collect();
+        let data64: Vec<i64> = data.iter().map(|&v| v as i64).collect();
+        let bytes = delta_bit_packed_encode_i64(&data64, 256, 1);
+
+        for skip in [3usize, 100, 256, 257, 700] {
+            let mut decoder = DeltaBitPackDecoder::<Int32Type>::new();
+            decoder.set_data(bytes.clone(), data.len()).unwrap();
+            assert_eq!(decoder.skip(skip).unwrap(), skip);
+            let mut buffer = vec![0i32; data.len() - skip];
+            assert_eq!(decoder.get(&mut buffer).unwrap(), buffer.len());
+            assert_eq!(&buffer, &data[skip..]);
+        }
+    }
+
+    #[test]
+    fn test_skip_delta_bit_packed_oversized_block_size_header() {
+        use crate::util::bit_util::BitWriter;
+
+        // A malformed header claiming 2^40 values per block (one mini-block) followed by
+        // a block header and almost no payload. `skip` must neither allocate a buffer
+        // proportional to the header nor panic — it must return an error promptly.
+        let block_size: u64 = 1 << 40;
+        let total_count: u64 = 1000;
+
+        let mut w = BitWriter::new(64);
+        w.put_vlq_int(block_size);
+        w.put_vlq_int(1); // mini_blocks_per_block
+        w.put_vlq_int(total_count);
+        w.put_zigzag_vlq_int(42); // first value
+        w.put_zigzag_vlq_int(1); // min_delta of the first block
+        w.put_aligned(3u8, 1); // bit width of the only mini-block
+        w.put_aligned(0xABu8, 1); // a single payload byte
+        let bytes = Bytes::from(w.consume());
+
+        let start = std::time::Instant::now();
+
+        let mut decoder = DeltaBitPackDecoder::<Int64Type>::new();
+        // The header itself passes the divisibility checks in `set_data`.
+        decoder.set_data(bytes.clone(), total_count as usize).unwrap();
+        assert_eq!(decoder.values_left(), total_count as usize);
+        // first value is consumed, then the truncated mini-block payload is detected.
+        let err = decoder.skip(10).unwrap_err();
+        assert!(
+            err.to_string().contains("Expected to skip"),
+            "unexpected error: {err}"
+        );
+
+        // Same via `get`.
+        let mut decoder = DeltaBitPackDecoder::<Int64Type>::new();
+        decoder.set_data(bytes, total_count as usize).unwrap();
+        let mut buffer = vec![0i64; 10];
+        let err = decoder.get(&mut buffer).unwrap_err();
+        assert!(
+            err.to_string().contains("Expected to read"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "oversized header took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
