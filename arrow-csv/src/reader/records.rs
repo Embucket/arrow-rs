@@ -17,12 +17,21 @@
 
 use arrow_schema::ArrowError;
 use csv_core::{ReadRecordResult, Reader};
+use std::sync::Arc;
+
+use super::{CsvRecordError, CsvRecordErrorHandler};
 
 /// The estimated length of a field in bytes
 const AVERAGE_FIELD_SIZE: usize = 8;
 
 /// The minimum amount of data in a single read
 const MIN_CAPACITY: usize = 1024;
+
+/// Prevent malformed records from growing the field-offset buffer without bound.
+///
+/// This is larger than typical schema limits and only applies after a record has already
+/// exceeded the configured schema width.
+const MAX_RECOVERABLE_EXCESS_FIELDS: usize = 16_384;
 
 /// [`RecordDecoder`] provides a push-based interface to decoder [`StringRecords`]
 #[derive(Debug)]
@@ -62,6 +71,20 @@ pub struct RecordDecoder {
     /// Default value is false
     /// When enabled fills in missing columns with null
     truncated_rows: bool,
+
+    /// Optional recovery hook. Keeping this `None` selects the allocation-free strict path.
+    record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
+
+    /// Raw bytes for the current record, retained only by the recovery path.
+    record_bytes: Vec<u8>,
+
+    /// Total number of input bytes consumed by the recovery path.
+    stream_offset: usize,
+
+    /// Start offsets for rolling back a malformed record from decoded output.
+    record_byte_offset: usize,
+    record_data_start: usize,
+    record_offsets_start: usize,
 }
 
 impl RecordDecoder {
@@ -77,13 +100,40 @@ impl RecordDecoder {
             data: vec![],
             num_rows: 0,
             truncated_rows,
+            record_error_handler: None,
+            record_bytes: vec![],
+            stream_offset: 0,
+            record_byte_offset: 0,
+            record_data_start: 0,
+            record_offsets_start: 1,
         }
+    }
+
+    pub fn with_record_error_handler(
+        mut self,
+        handler: Option<Arc<dyn CsvRecordErrorHandler>>,
+    ) -> Self {
+        self.record_error_handler = handler;
+        self
     }
 
     /// Decodes records from `input` returning the number of records and bytes read
     ///
     /// Note: this expects to be called with an empty `input` to signal EOF
     pub fn decode(&mut self, input: &[u8], to_read: usize) -> Result<(usize, usize), ArrowError> {
+        match self.record_error_handler.clone() {
+            Some(handler) => {
+                self.decode_with_record_error_handler(input, to_read, handler.as_ref())
+            }
+            None => self.decode_strict(input, to_read),
+        }
+    }
+
+    fn decode_strict(
+        &mut self,
+        input: &[u8],
+        to_read: usize,
+    ) -> Result<(usize, usize), ArrowError> {
         if to_read == 0 {
             return Ok((0, 0));
         }
@@ -170,6 +220,122 @@ impl RecordDecoder {
         }
     }
 
+    fn decode_with_record_error_handler(
+        &mut self,
+        input: &[u8],
+        to_read: usize,
+        handler: &dyn CsvRecordErrorHandler,
+    ) -> Result<(usize, usize), ArrowError> {
+        if to_read == 0 {
+            return Ok((0, 0));
+        }
+
+        self.offsets
+            .resize(self.offsets_len + to_read * self.num_columns, 0);
+        let max_offsets_len = self
+            .offsets
+            .len()
+            .checked_add(MAX_RECOVERABLE_EXCESS_FIELDS)
+            .ok_or_else(|| ArrowError::CsvError("CSV field offset capacity overflowed".into()))?;
+        let mut input_offset = 0;
+        let mut read = 0;
+
+        loop {
+            let remaining_rows = to_read - read;
+            let capacity = remaining_rows * self.num_columns * AVERAGE_FIELD_SIZE;
+            let estimated_data = capacity.max(MIN_CAPACITY);
+            self.data.resize(self.data_len + estimated_data, 0);
+
+            loop {
+                let record_input_start = input_offset;
+                let (result, bytes_read, bytes_written, end_positions) =
+                    self.delimiter.read_record(
+                        &input[input_offset..],
+                        &mut self.data[self.data_len..],
+                        &mut self.offsets[self.offsets_len..],
+                    );
+
+                self.current_field += end_positions;
+                self.offsets_len += end_positions;
+                input_offset += bytes_read;
+                self.data_len += bytes_written;
+                self.stream_offset =
+                    self.stream_offset.checked_add(bytes_read).ok_or_else(|| {
+                        ArrowError::CsvError("CSV input byte offset overflowed".into())
+                    })?;
+                self.record_bytes
+                    .extend_from_slice(&input[record_input_start..input_offset]);
+
+                match result {
+                    ReadRecordResult::End | ReadRecordResult::InputEmpty => {
+                        return Ok((read, input_offset));
+                    }
+                    ReadRecordResult::OutputFull => break,
+                    ReadRecordResult::OutputEndsFull => {
+                        let new_len = self
+                            .offsets
+                            .len()
+                            .checked_add(self.num_columns.max(1))
+                            .ok_or_else(|| {
+                                ArrowError::CsvError("CSV field offset capacity overflowed".into())
+                            })?
+                            .min(max_offsets_len);
+                        if new_len == self.offsets.len() {
+                            return Err(ArrowError::CsvError(format!(
+                                "malformed CSV record on line {} exceeds the recovery limit of {} excess fields",
+                                self.line_number, MAX_RECOVERABLE_EXCESS_FIELDS
+                            )));
+                        }
+                        self.offsets.resize(new_len, 0);
+                    }
+                    ReadRecordResult::Record => {
+                        if self.current_field != self.num_columns
+                            && !(self.truncated_rows && self.current_field < self.num_columns)
+                        {
+                            handler.handle(&CsvRecordError {
+                                line_number: self.line_number,
+                                byte_offset: self.record_byte_offset,
+                                expected_fields: self.num_columns,
+                                actual_fields: self.current_field,
+                                record: &self.record_bytes,
+                            })?;
+                            self.data_len = self.record_data_start;
+                            self.offsets_len = self.record_offsets_start;
+                            self.current_field = 0;
+                            self.line_number += 1;
+                            self.record_bytes.clear();
+                            self.record_byte_offset = self.stream_offset;
+                            continue;
+                        }
+
+                        if self.current_field < self.num_columns {
+                            let fill_count = self.num_columns - self.current_field;
+                            let fill_value = self.offsets[self.offsets_len - 1];
+                            self.offsets[self.offsets_len..self.offsets_len + fill_count]
+                                .fill(fill_value);
+                            self.offsets_len += fill_count;
+                        }
+                        read += 1;
+                        self.current_field = 0;
+                        self.line_number += 1;
+                        self.num_rows += 1;
+                        self.record_bytes.clear();
+                        self.record_byte_offset = self.stream_offset;
+                        self.record_data_start = self.data_len;
+                        self.record_offsets_start = self.offsets_len;
+
+                        if read == to_read {
+                            return Ok((read, input_offset));
+                        }
+                        if input.len() == input_offset {
+                            return Ok((read, input_offset));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Returns the current number of buffered records
     pub fn len(&self) -> usize {
         self.num_rows
@@ -186,6 +352,8 @@ impl RecordDecoder {
         self.offsets_len = 1;
         self.data_len = 0;
         self.num_rows = 0;
+        self.record_data_start = 0;
+        self.record_offsets_start = 1;
     }
 
     /// Flushes the current contents of the reader
@@ -240,6 +408,8 @@ impl RecordDecoder {
         self.offsets_len = 1;
         self.data_len = 0;
         self.num_rows = 0;
+        self.record_data_start = 0;
+        self.record_offsets_start = 1;
 
         Ok(StringRecords {
             num_rows,
@@ -313,8 +483,36 @@ impl std::fmt::Display for StringRecord<'_> {
 #[cfg(test)]
 mod tests {
     use crate::reader::records::RecordDecoder;
+    use crate::reader::{CsvRecordError, CsvRecordErrorHandler};
+    use arrow_schema::ArrowError;
     use csv_core::Reader;
     use std::io::{BufRead, BufReader, Cursor};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    struct OwnedRecordError {
+        line_number: usize,
+        byte_offset: usize,
+        expected_fields: usize,
+        actual_fields: usize,
+        record: Vec<u8>,
+    }
+
+    #[derive(Debug, Default)]
+    struct CollectRecordErrors(Mutex<Vec<OwnedRecordError>>);
+
+    impl CsvRecordErrorHandler for CollectRecordErrors {
+        fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            self.0.lock().unwrap().push(OwnedRecordError {
+                line_number: error.line_number,
+                byte_offset: error.byte_offset,
+                expected_fields: error.expected_fields,
+                actual_fields: error.actual_fields,
+                record: error.record.to_vec(),
+            });
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_basic() {
@@ -385,6 +583,58 @@ mod tests {
         let remaining = &csv.as_bytes()[bytes..];
         let err = decoder.decode(remaining, 3).unwrap_err().to_string();
         assert_eq!(err, expected);
+    }
+
+    #[test]
+    fn test_invalid_fields_handler_skips_records_across_input_chunks() {
+        let csv = b"1,ok\n2,extra,value\n3\n4,after\n";
+        let handler = Arc::new(CollectRecordErrors::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let mut reader = BufReader::with_capacity(3, Cursor::new(csv));
+
+        loop {
+            let buf = reader.fill_buf().unwrap();
+            let (_, bytes) = decoder.decode(buf, 4 - decoder.len()).unwrap();
+            reader.consume(bytes);
+            if bytes == 0 || decoder.len() == 4 {
+                break;
+            }
+        }
+
+        let records = decoder.flush().unwrap();
+        let actual = records
+            .iter()
+            .map(|record| [record.get(0).to_owned(), record.get(1).to_owned()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                [String::from("1"), String::from("ok")],
+                [String::from("4"), String::from("after")],
+            ]
+        );
+
+        let errors = handler.0.lock().unwrap();
+        assert_eq!(
+            *errors,
+            [
+                OwnedRecordError {
+                    line_number: 2,
+                    byte_offset: 5,
+                    expected_fields: 2,
+                    actual_fields: 3,
+                    record: b"2,extra,value\n".to_vec(),
+                },
+                OwnedRecordError {
+                    line_number: 3,
+                    byte_offset: 19,
+                    expected_fields: 2,
+                    actual_fields: 1,
+                    record: b"3\n".to_vec(),
+                },
+            ]
+        );
     }
 
     #[test]

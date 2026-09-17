@@ -182,6 +182,27 @@ use crate::map_csv_error;
 use crate::reader::records::{RecordDecoder, StringRecords};
 use arrow_array::timezone::Tz;
 
+/// Metadata for a CSV record whose field count does not match the reader schema.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CsvRecordError<'a> {
+    /// One-based record number, including any header row.
+    pub line_number: usize,
+    /// Zero-based byte offset of the start of the record in the input stream.
+    pub byte_offset: usize,
+    /// Number of fields required by the reader schema.
+    pub expected_fields: usize,
+    /// Number of fields found in the record.
+    pub actual_fields: usize,
+    /// Original record bytes, including its record terminator when present.
+    pub record: &'a [u8],
+}
+
+/// Receives malformed CSV records that should be skipped instead of aborting the scan.
+pub trait CsvRecordErrorHandler: Debug + Send + Sync {
+    /// Handle one malformed record. Returning an error aborts the scan.
+    fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError>;
+}
+
 /// Order should match [`InferredDataType`]
 static REGEX_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -1162,6 +1183,8 @@ pub struct ReaderBuilder {
     bounds: Bounds,
     /// Optional projection for which columns to load (zero-based column indices)
     projection: Option<Vec<usize>>,
+    /// Optional handler for records whose field count differs from the schema.
+    record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
 }
 
 impl ReaderBuilder {
@@ -1194,6 +1217,7 @@ impl ReaderBuilder {
             batch_size: 1024,
             bounds: None,
             projection: None,
+            record_error_handler: None,
         }
     }
 
@@ -1283,6 +1307,15 @@ impl ReaderBuilder {
         self
     }
 
+    /// Skip records whose field count differs from the schema and report them to `handler`.
+    ///
+    /// The default strict path does not retain raw record bytes and is unchanged when no
+    /// handler is configured.
+    pub fn with_record_error_handler(mut self, handler: Arc<dyn CsvRecordErrorHandler>) -> Self {
+        self.record_error_handler = Some(handler);
+        self
+    }
+
     /// Create a new `Reader` from a non-buffered reader
     ///
     /// If `R: BufRead` consider using [`Self::build_buffered`] to avoid unnecessary additional
@@ -1306,7 +1339,8 @@ impl ReaderBuilder {
             delimiter,
             self.schema.fields().len(),
             self.format.truncated_rows,
-        );
+        )
+        .with_record_error_handler(self.record_error_handler);
 
         let header = self.format.header as usize;
 
