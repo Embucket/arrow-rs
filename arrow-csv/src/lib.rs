@@ -30,7 +30,8 @@ pub mod reader;
 pub mod writer;
 
 pub use self::reader::{
-    CsvRecordError, CsvRecordErrorHandler, Reader, ReaderBuilder, infer_schema_from_files,
+    CsvRecord, CsvRecordError, CsvRecordErrorHandler, Reader, ReaderBuilder,
+    infer_schema_from_files,
 };
 pub use self::writer::QuoteStyle;
 pub use self::writer::Writer;
