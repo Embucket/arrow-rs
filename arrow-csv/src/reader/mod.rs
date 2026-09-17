@@ -197,10 +197,29 @@ pub struct CsvRecordError<'a> {
     pub record: &'a [u8],
 }
 
+/// Source metadata for a successfully decoded CSV record.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CsvRecord<'a> {
+    /// One-based record number, including any header row.
+    pub line_number: usize,
+    /// Zero-based byte offset of the start of the record in the input stream.
+    pub byte_offset: usize,
+    /// Original record bytes, including its record terminator when present.
+    pub record: &'a [u8],
+}
+
 /// Receives malformed CSV records that should be skipped instead of aborting the scan.
 pub trait CsvRecordErrorHandler: Debug + Send + Sync {
     /// Handle one malformed record. Returning an error aborts the scan.
     fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError>;
+
+    /// Observe one successfully decoded record.
+    ///
+    /// This callback is invoked only when a record error handler is configured. The default
+    /// implementation preserves the existing malformed-record-only behavior.
+    fn handle_record(&self, _record: &CsvRecord<'_>) -> Result<(), ArrowError> {
+        Ok(())
+    }
 }
 
 /// Order should match [`InferredDataType`]
