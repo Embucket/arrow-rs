@@ -230,13 +230,11 @@ impl RecordDecoder {
             return Ok((0, 0));
         }
 
-        self.offsets
-            .resize(self.offsets_len + to_read * self.num_columns, 0);
-        let max_offsets_len = self
-            .offsets
-            .len()
-            .checked_add(MAX_RECOVERABLE_EXCESS_FIELDS)
+        let required_offsets = to_read
+            .checked_mul(self.num_columns)
+            .and_then(|additional| self.offsets_len.checked_add(additional))
             .ok_or_else(|| ArrowError::CsvError("CSV field offset capacity overflowed".into()))?;
+        self.offsets.resize(required_offsets, 0);
         let mut input_offset = 0;
         let mut read = 0;
 
@@ -247,12 +245,20 @@ impl RecordDecoder {
             self.data.resize(self.data_len + estimated_data, 0);
 
             loop {
+                let max_offsets_len = self
+                    .record_offsets_start
+                    .checked_add(self.num_columns)
+                    .and_then(|expected| expected.checked_add(MAX_RECOVERABLE_EXCESS_FIELDS))
+                    .ok_or_else(|| {
+                        ArrowError::CsvError("CSV field offset capacity overflowed".into())
+                    })?;
+                let offsets_end = self.offsets.len().min(max_offsets_len);
                 let record_input_start = input_offset;
                 let (result, bytes_read, bytes_written, end_positions) =
                     self.delimiter.read_record(
                         &input[input_offset..],
                         &mut self.data[self.data_len..],
-                        &mut self.offsets[self.offsets_len..],
+                        &mut self.offsets[self.offsets_len..offsets_end],
                     );
 
                 self.current_field += end_positions;
@@ -272,20 +278,16 @@ impl RecordDecoder {
                     }
                     ReadRecordResult::OutputFull => break,
                     ReadRecordResult::OutputEndsFull => {
+                        if self.offsets_len >= max_offsets_len {
+                            return Err(recovery_limit_error(self.line_number));
+                        }
                         let new_len = self
-                            .offsets
-                            .len()
+                            .offsets_len
                             .checked_add(self.num_columns.max(1))
                             .ok_or_else(|| {
                                 ArrowError::CsvError("CSV field offset capacity overflowed".into())
                             })?
                             .min(max_offsets_len);
-                        if new_len == self.offsets.len() {
-                            return Err(ArrowError::CsvError(format!(
-                                "malformed CSV record on line {} exceeds the recovery limit of {} excess fields",
-                                self.line_number, MAX_RECOVERABLE_EXCESS_FIELDS
-                            )));
-                        }
                         self.offsets.resize(new_len, 0);
                     }
                     ReadRecordResult::Record => {
@@ -420,6 +422,12 @@ impl RecordDecoder {
     }
 }
 
+fn recovery_limit_error(line_number: usize) -> ArrowError {
+    ArrowError::CsvError(format!(
+        "malformed CSV record on line {line_number} exceeds the recovery limit of {MAX_RECOVERABLE_EXCESS_FIELDS} excess fields"
+    ))
+}
+
 /// A collection of parsed, UTF-8 CSV records
 #[derive(Debug)]
 pub struct StringRecords<'a> {
@@ -482,12 +490,13 @@ impl std::fmt::Display for StringRecord<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::reader::records::RecordDecoder;
     use crate::reader::{CsvRecordError, CsvRecordErrorHandler};
     use arrow_schema::ArrowError;
     use csv_core::Reader;
     use std::io::{BufRead, BufReader, Cursor};
     use std::sync::{Arc, Mutex};
+
+    use super::{MAX_RECOVERABLE_EXCESS_FIELDS, RecordDecoder, recovery_limit_error};
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct OwnedRecordError {
@@ -635,6 +644,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_invalid_fields_handler_bounds_offsets_across_input_chunks() {
+        let mut csv = Vec::with_capacity(2 * (MAX_RECOVERABLE_EXCESS_FIELDS + 3));
+        for _ in 0..MAX_RECOVERABLE_EXCESS_FIELDS + 3 {
+            csv.extend_from_slice(b"x,");
+        }
+        csv.push(b'\n');
+
+        let handler = Arc::new(CollectRecordErrors::default());
+        let mut decoder =
+            RecordDecoder::new(Reader::new(), 2, false).with_record_error_handler(Some(handler));
+        let mut input_offset = 0_usize;
+        let error = loop {
+            let input_end = input_offset.saturating_add(17).min(csv.len());
+            match decoder.decode(&csv[input_offset..input_end], 1) {
+                Ok((_, bytes_read)) => {
+                    assert!(bytes_read > 0);
+                    input_offset += bytes_read;
+                }
+                Err(error) => break error,
+            }
+        };
+
+        assert_eq!(error.to_string(), recovery_limit_error(1).to_string());
+        assert_eq!(decoder.offsets.len(), 1 + 2 + MAX_RECOVERABLE_EXCESS_FIELDS);
     }
 
     #[test]
