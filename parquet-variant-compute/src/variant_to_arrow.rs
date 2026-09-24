@@ -24,18 +24,19 @@ use crate::type_conversion::{
     variant_to_unscaled_decimal,
 };
 use crate::variant_array::ShreddedVariantFieldArray;
-use crate::{VariantArray, VariantValueArrayBuilder};
+use crate::{VariantArray, VariantArrayBuilder, VariantType, VariantValueArrayBuilder};
 use arrow::array::{
-    ArrayRef, ArrowNativeTypeOp, BinaryBuilder, BinaryLikeArrayBuilder, BinaryViewBuilder,
+    Array, ArrayRef, ArrowNativeTypeOp, BinaryBuilder, BinaryLikeArrayBuilder, BinaryViewBuilder,
     BooleanBuilder, FixedSizeBinaryBuilder, FixedSizeListArray, GenericListArray,
     GenericListViewArray, LargeBinaryBuilder, LargeStringBuilder, MapArray, NullArray,
     NullBufferBuilder, OffsetSizeTrait, PrimitiveBuilder, StringBuilder, StringLikeArrayBuilder,
     StringViewBuilder, StructArray,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow::compute::{CastOptions, DecimalCast, cast_with_options};
+use arrow::compute::{CastOptions, DecimalCast, cast, cast_with_options};
 use arrow::datatypes::{self, DataType, DecimalType};
 use arrow::error::{ArrowError, Result};
+use arrow_schema::extension::ExtensionType;
 use arrow_schema::{FieldRef, Fields, TimeUnit};
 use parquet_variant::{Variant, VariantPath};
 use std::sync::Arc;
@@ -51,6 +52,7 @@ pub(crate) enum VariantToArrowRowBuilder<'a> {
     Map(MapVariantToArrowRowBuilder<'a>),
     Encoded(EncodedVariantToArrowRowBuilder<'a>),
     BinaryVariant(VariantToBinaryVariantArrowRowBuilder),
+    NativeVariant(VariantArrayBuilder, Fields),
 
     // Path extraction wrapper - contains a boxed enum for any of the above
     WithPath(VariantPathRowBuilder<'a>),
@@ -66,6 +68,10 @@ impl<'a> VariantToArrowRowBuilder<'a> {
             Map(b) => b.append_null(),
             Encoded(b) => b.append_null(),
             BinaryVariant(b) => b.append_null(),
+            NativeVariant(b, _) => {
+                b.append_null();
+                Ok(())
+            }
             WithPath(path_builder) => path_builder.append_null(),
         }
     }
@@ -79,6 +85,10 @@ impl<'a> VariantToArrowRowBuilder<'a> {
             Map(b) => b.append_value(&value),
             Encoded(b) => b.append_value(value),
             BinaryVariant(b) => b.append_value(value),
+            NativeVariant(b, _) => {
+                b.append_variant(value);
+                Ok(true)
+            }
             WithPath(path_builder) => path_builder.append_value(value),
         }
     }
@@ -92,9 +102,73 @@ impl<'a> VariantToArrowRowBuilder<'a> {
             Map(b) => b.finish(),
             Encoded(b) => b.finish(),
             BinaryVariant(b) => b.finish(),
+            NativeVariant(b, fields) => {
+                let built = b.build();
+                let inner = built.inner();
+                if inner.data_type() == &DataType::Struct(fields.clone()) {
+                    return Ok(ArrayRef::from(built));
+                }
+                let columns = fields
+                    .iter()
+                    .map(|field| {
+                        let column = inner.column_by_name(field.name()).ok_or_else(|| {
+                            ArrowError::InvalidArgumentError(format!(
+                                "Nested Variant is missing the '{}' field",
+                                field.name()
+                            ))
+                        })?;
+                        cast(column.as_ref(), field.data_type())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(StructArray::try_new(
+                    fields,
+                    columns,
+                    inner.nulls().cloned(),
+                )?))
+            }
             WithPath(path_builder) => path_builder.finish(),
         }
     }
+}
+
+fn make_typed_variant_to_arrow_field_builder<'a>(
+    field: &FieldRef,
+    data_type: &'a DataType,
+    cast_options: &'a CastOptions,
+    capacity: usize,
+) -> Result<VariantToArrowRowBuilder<'a>> {
+    if field.extension_type_name() == Some(VariantType::NAME) {
+        let DataType::Struct(fields) = field.data_type() else {
+            return Err(ArrowError::InvalidArgumentError(
+                "Nested Variant extension requires Struct storage".to_string(),
+            ));
+        };
+        if fields.iter().any(|field| field.name() == "typed_value") {
+            return Err(ArrowError::NotYetImplemented(
+                "variant_get with shredded nested Variant output is not yet supported".to_string(),
+            ));
+        }
+        if fields.len() != 2
+            || !["metadata", "value"].iter().all(|name| {
+                fields.iter().any(|field| {
+                    field.name() == *name
+                        && matches!(
+                            field.data_type(),
+                            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+                        )
+                })
+            })
+        {
+            return Err(ArrowError::NotYetImplemented(
+                "Nested Variant output requires binary metadata and value fields".to_string(),
+            ));
+        }
+        return Ok(VariantToArrowRowBuilder::NativeVariant(
+            VariantArrayBuilder::new(capacity),
+            fields.clone(),
+        ));
+    }
+    make_typed_variant_to_arrow_row_builder(data_type, cast_options, capacity)
 }
 
 fn make_typed_variant_to_arrow_row_builder<'a>(
@@ -599,7 +673,8 @@ impl<'a> StructVariantToArrowRowBuilder<'a> {
     ) -> Result<Self> {
         let mut field_builders = Vec::with_capacity(fields.len());
         for field in fields.iter() {
-            field_builders.push(make_typed_variant_to_arrow_row_builder(
+            field_builders.push(make_typed_variant_to_arrow_field_builder(
+                field,
                 field.data_type(),
                 cast_options,
                 capacity,
@@ -701,12 +776,14 @@ impl<'a> MapVariantToArrowRowBuilder<'a> {
                 )));
             }
         };
-        let key_builder = Box::new(make_typed_variant_to_arrow_row_builder(
+        let key_builder = Box::new(make_typed_variant_to_arrow_field_builder(
+            key_field,
             key_field.data_type(),
             cast_options,
             capacity,
         )?);
-        let value_builder = Box::new(make_typed_variant_to_arrow_row_builder(
+        let value_builder = Box::new(make_typed_variant_to_arrow_field_builder(
+            value_field,
             value_field.data_type(),
             cast_options,
             capacity,
@@ -1200,8 +1277,12 @@ where
             )?;
             ListElementBuilder::Shredded(Box::new(builder))
         } else {
-            let builder =
-                make_typed_variant_to_arrow_row_builder(element_data_type, cast_options, capacity)?;
+            let builder = make_typed_variant_to_arrow_field_builder(
+                &field,
+                element_data_type,
+                cast_options,
+                capacity,
+            )?;
             ListElementBuilder::Typed(Box::new(builder))
         };
 
@@ -1305,8 +1386,12 @@ impl<'a> VariantToFixedSizeListArrowRowBuilder<'a> {
             )?;
             ListElementBuilder::Shredded(Box::new(builder))
         } else {
-            let builder =
-                make_typed_variant_to_arrow_row_builder(element_data_type, cast_options, capacity)?;
+            let builder = make_typed_variant_to_arrow_field_builder(
+                &field,
+                element_data_type,
+                cast_options,
+                capacity,
+            )?;
             ListElementBuilder::Typed(Box::new(builder))
         };
         Ok(Self {

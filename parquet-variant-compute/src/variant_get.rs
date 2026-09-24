@@ -499,7 +499,7 @@ mod test {
         Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array,
         FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
         Int64Array, Int64Builder, LargeBinaryArray, LargeListArray, LargeListViewArray,
-        LargeStringArray, ListArray, ListBuilder, ListViewArray, MapBuilder, NullArray,
+        LargeStringArray, ListArray, ListBuilder, ListViewArray, MapArray, MapBuilder, NullArray,
         NullBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
         Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
     };
@@ -4500,6 +4500,117 @@ mod test {
         expected.append(true).unwrap();
         let expected = expected.finish();
         assert_eq!(result.as_ref(), &expected);
+    }
+
+    #[test]
+    fn get_variant_as_map_of_variant_lists() {
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            Some(r#"{"a":[1,null],"b":[]}"#),
+            None,
+        ]));
+        let variants = ArrayRef::from(json_to_variant(&input).unwrap());
+        let item = VariantArrayBuilder::new(0).build().field("item");
+        let data_type = map_data_type(DataType::List(Arc::new(item)));
+
+        let result = variant_get(&variants, map_get_options(&data_type)).unwrap();
+        assert_eq!(result.data_type(), &data_type);
+        let map = result.as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(map.is_null(1));
+        let lists = map.values().as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(lists.value_length(0), 2);
+        assert_eq!(lists.value_length(1), 0);
+        let values = lists.value(0);
+        let nested = VariantArray::try_new(&values).unwrap();
+        let expected: ArrayRef = Arc::new(StringArray::from(vec![Some("1"), Some("null")]));
+        let expected = json_to_variant(&expected).unwrap();
+        assert_eq!(nested.try_value(0).unwrap(), expected.try_value(0).unwrap());
+        assert_eq!(nested.try_value(1).unwrap(), expected.try_value(1).unwrap());
+    }
+
+    #[test]
+    fn get_variant_as_map_of_variant_structs() {
+        let input: ArrayRef = Arc::new(StringArray::from(vec![Some(
+            r#"{"a":{"v":1},"b":{"v":null},"c":{}}"#,
+        )]));
+        let variants = ArrayRef::from(json_to_variant(&input).unwrap());
+        let value = VariantArrayBuilder::new(0)
+            .build()
+            .field("v")
+            .with_nullable(true);
+        let data_type = map_data_type(DataType::Struct(Fields::from(vec![value])));
+
+        let result = variant_get(&variants, map_get_options(&data_type)).unwrap();
+        assert_eq!(result.data_type(), &data_type);
+        let map = result.as_any().downcast_ref::<MapArray>().unwrap();
+        let objects = map.values().as_any().downcast_ref::<StructArray>().unwrap();
+        let nested = VariantArray::try_new(objects.column(0)).unwrap();
+        let expected: ArrayRef = Arc::new(StringArray::from(vec![Some("1"), Some("null")]));
+        let expected = json_to_variant(&expected).unwrap();
+        assert_eq!(nested.try_value(0).unwrap(), expected.try_value(0).unwrap());
+        assert_eq!(nested.try_value(1).unwrap(), expected.try_value(1).unwrap());
+        assert!(nested.is_null(2));
+    }
+
+    #[test]
+    fn get_variant_as_map_preserves_nested_variant_storage() {
+        let input: ArrayRef = Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)]));
+        let variants = ArrayRef::from(json_to_variant(&input).unwrap());
+        let value = VariantArrayBuilder::new(0)
+            .build()
+            .field("values")
+            .with_data_type(DataType::Struct(Fields::from(vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, true),
+            ])));
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("keys", DataType::Utf8, false),
+                    value,
+                ])),
+                false,
+            )),
+            false,
+        );
+
+        let result = variant_get(&variants, map_get_options(&data_type)).unwrap();
+        assert_eq!(result.data_type(), &data_type);
+        let map = result.as_any().downcast_ref::<MapArray>().unwrap();
+        let nested = VariantArray::try_new(map.values()).unwrap();
+        let expected: ArrayRef = Arc::new(StringArray::from(vec![Some("1")]));
+        let expected = json_to_variant(&expected).unwrap();
+        assert_eq!(nested.try_value(0).unwrap(), expected.try_value(0).unwrap());
+    }
+
+    #[test]
+    fn get_variant_as_map_rejects_nested_shredded_variant() {
+        let input: ArrayRef = Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)]));
+        let variants = ArrayRef::from(json_to_variant(&input).unwrap());
+        let value = VariantArrayBuilder::new(0).build().field("values");
+        let DataType::Struct(fields) = value.data_type() else {
+            unreachable!("Variant storage is a struct");
+        };
+        let mut fields = fields
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields.push(Field::new("typed_value", DataType::Int64, true));
+        let value = value.with_data_type(DataType::Struct(Fields::from(fields)));
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("keys", DataType::Utf8, false),
+                    value,
+                ])),
+                false,
+            )),
+            false,
+        );
+
+        let error = variant_get(&variants, map_get_options(&data_type)).unwrap_err();
+        assert!(error.to_string().contains("shredded nested Variant output"));
     }
 
     #[test]
