@@ -64,7 +64,7 @@ fn bench_from_json(c: &mut Criterion) {
         ),
         ("equal_large_array_1024", large_array.as_str(), true),
         ("equal_large_string_8k", large_string.as_str(), true),
-        ("duplicate_large_100k", duplicate_large.as_str(), false),
+        ("duplicate_large_100k", duplicate_large.as_str(), true),
     ];
 
     let mut group = c.benchmark_group("variant_from_json");
@@ -77,15 +77,17 @@ fn bench_from_json(c: &mut Criterion) {
             append_json(&parsed, &mut value_tree).expect("valid Variant");
             let (direct_metadata, direct_value) = direct.finish();
             let (tree_metadata, tree_value) = value_tree.finish();
-            let direct_json = Variant::try_new(&direct_metadata, &direct_value)
-                .expect("valid direct Variant")
-                .to_json_value()
-                .expect("decodable direct Variant");
-            let tree_json = Variant::try_new(&tree_metadata, &tree_value)
-                .expect("valid tree Variant")
-                .to_json_value()
-                .expect("decodable tree Variant");
-            assert_eq!(direct_json, tree_json, "{name}");
+            let direct_variant =
+                Variant::try_new(&direct_metadata, &direct_value).expect("valid direct Variant");
+            let tree_variant =
+                Variant::try_new(&tree_metadata, &tree_value).expect("valid tree Variant");
+            assert_eq!(direct_variant, tree_variant, "{name}");
+            if name == "duplicate_large_100k" {
+                assert_eq!(
+                    direct_variant.to_json_value().expect("decodable Variant"),
+                    serde_json::json!({"a": 0})
+                );
+            }
         }
         group.throughput(Throughput::Bytes(
             u64::try_from(json.len()).expect("input size"),
