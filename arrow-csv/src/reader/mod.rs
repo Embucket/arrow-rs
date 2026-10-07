@@ -237,18 +237,34 @@ static REGEX_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// A wrapper over `Option<Regex>` to check if the value is `NULL`.
+/// Determines whether a decoded CSV field represents `NULL`.
 #[derive(Debug, Clone, Default)]
-struct NullRegex(Option<Regex>);
+enum NullRegex {
+    #[default]
+    Empty,
+    Regex(Regex),
+    Exact(Vec<String>),
+    ExactSet(std::collections::HashSet<String>),
+}
 
 impl NullRegex {
+    fn from_values(values: Vec<String>) -> Self {
+        if values.len() > 8 {
+            Self::ExactSet(values.into_iter().collect())
+        } else {
+            Self::Exact(values)
+        }
+    }
+
     /// Returns true if the value should be considered as `NULL` according to
     /// the provided regular expression.
     #[inline]
     fn is_null(&self, s: &str) -> bool {
-        match &self.0 {
-            Some(r) => r.is_match(s),
-            None => s.is_empty(),
+        match self {
+            Self::Empty => s.is_empty(),
+            Self::Regex(r) => r.is_match(s),
+            Self::Exact(values) => values.iter().any(|value| value == s),
+            Self::ExactSet(values) => values.contains(s),
         }
     }
 }
@@ -321,6 +337,7 @@ pub struct Format {
     comment: Option<u8>,
     null_regex: NullRegex,
     truncated_rows: bool,
+    preserve_quoted_empty: bool,
 }
 
 impl Format {
@@ -376,7 +393,22 @@ impl Format {
 
     /// Provide a regex to match null values, defaults to `^$`
     pub fn with_null_regex(mut self, null_regex: Regex) -> Self {
-        self.null_regex = NullRegex(Some(null_regex));
+        self.null_regex = NullRegex::Regex(null_regex);
+        self
+    }
+
+    /// Match exact CSV null values without a regex check for every field.
+    pub fn with_null_values(mut self, values: Vec<String>) -> Self {
+        self.null_regex = NullRegex::from_values(values);
+        self
+    }
+
+    /// Keep quoted empty fields distinct from unquoted empty fields when matching nulls.
+    ///
+    /// Schema inference is not available when the null matcher includes an empty
+    /// field: use [`ReaderBuilder`] with an explicit schema in that case.
+    pub fn with_preserve_quoted_empty(mut self, preserve: bool) -> Self {
+        self.preserve_quoted_empty = preserve;
         self
     }
 
@@ -402,6 +434,11 @@ impl Format {
         reader: R,
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
+        if self.preserve_quoted_empty && self.null_regex.is_null("") {
+            return Err(ArrowError::CsvError(
+                "quoted-empty preservation requires an explicit CSV schema".to_owned(),
+            ));
+        }
         let mut csv_reader = self.build_reader(reader);
 
         // get or create header names
@@ -913,7 +950,7 @@ fn parse(
                     rows.iter()
                         .map(|row| {
                             let s = row.get(i);
-                            (!null_regex.is_null(s)).then_some(s)
+                            (!row.is_null(i, s, null_regex)).then_some(s)
                         })
                         .collect::<StringArray>(),
                 ) as ArrayRef),
@@ -921,7 +958,7 @@ fn parse(
                     rows.iter()
                         .map(|row| {
                             let s = row.get(i);
-                            (!null_regex.is_null(s)).then_some(s)
+                            (!row.is_null(i, s, null_regex)).then_some(s)
                         })
                         .collect::<StringViewArray>(),
                 ) as ArrayRef),
@@ -933,7 +970,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_null(i, s, null_regex)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<Int8Type>>(),
                         ) as ArrayRef),
@@ -941,7 +978,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_null(i, s, null_regex)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<Int16Type>>(),
                         ) as ArrayRef),
@@ -949,7 +986,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_null(i, s, null_regex)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<Int32Type>>(),
                         ) as ArrayRef),
@@ -957,7 +994,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_null(i, s, null_regex)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<Int64Type>>(),
                         ) as ArrayRef),
@@ -965,7 +1002,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_null(i, s, null_regex)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<UInt8Type>>(),
                         ) as ArrayRef),
@@ -973,7 +1010,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_null(i, s, null_regex)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<UInt16Type>>(),
                         ) as ArrayRef),
@@ -981,7 +1018,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_null(i, s, null_regex)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<UInt32Type>>(),
                         ) as ArrayRef),
@@ -989,7 +1026,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_null(i, s, null_regex)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<UInt64Type>>(),
                         ) as ArrayRef),
@@ -1045,7 +1082,7 @@ fn build_decimal_array<T: DecimalType>(
     let mut decimal_builder = PrimitiveBuilder::<T>::with_capacity(rows.len());
     for row in rows.iter() {
         let s = row.get(col_idx);
-        if null_regex.is_null(s) {
+        if row.is_null(col_idx, s, null_regex) {
             // append null
             decimal_builder.append_null();
         } else {
@@ -1078,7 +1115,7 @@ fn build_primitive_array<T: ArrowPrimitiveType + Parser>(
         .enumerate()
         .map(|(row_index, row)| {
             let s = row.get(col_idx);
-            if null_regex.is_null(s) {
+            if row.is_null(col_idx, s, null_regex) {
                 return Ok(None);
             }
 
@@ -1127,7 +1164,7 @@ fn build_timestamp_array_impl<T: ArrowTimestampType, Tz: TimeZone>(
         .enumerate()
         .map(|(row_index, row)| {
             let s = row.get(col_idx);
-            if null_regex.is_null(s) {
+            if row.is_null(col_idx, s, null_regex) {
                 return Ok(None);
             }
 
@@ -1166,7 +1203,7 @@ fn build_boolean_array(
         .enumerate()
         .map(|(row_index, row)| {
             let s = row.get(col_idx);
-            if null_regex.is_null(s) {
+            if row.is_null(col_idx, s, null_regex) {
                 return Ok(None);
             }
             let parsed = parse_bool(s);
@@ -1292,7 +1329,19 @@ impl ReaderBuilder {
 
     /// Provide a regex to match null values, defaults to `^$`
     pub fn with_null_regex(mut self, null_regex: Regex) -> Self {
-        self.format.null_regex = NullRegex(Some(null_regex));
+        self.format.null_regex = NullRegex::Regex(null_regex);
+        self
+    }
+
+    /// Match exact CSV null values without a regex check for every field.
+    pub fn with_null_values(mut self, values: Vec<String>) -> Self {
+        self.format.null_regex = NullRegex::from_values(values);
+        self
+    }
+
+    /// Keep quoted empty fields distinct from unquoted empty fields when matching nulls.
+    pub fn with_preserve_quoted_empty(mut self, preserve: bool) -> Self {
+        self.format.preserve_quoted_empty = preserve;
         self
     }
 
@@ -1354,12 +1403,22 @@ impl ReaderBuilder {
     /// Builds a decoder that can be used to decode CSV from an arbitrary byte stream
     pub fn build_decoder(self) -> Decoder {
         let delimiter = self.format.build_parser();
-        let record_decoder = RecordDecoder::new(
+        let mut record_decoder = RecordDecoder::new(
             delimiter,
             self.schema.fields().len(),
             self.format.truncated_rows,
         )
         .with_record_error_handler(self.record_error_handler);
+        if self.format.preserve_quoted_empty {
+            let quote = self.format.quote.unwrap_or(b'"');
+            record_decoder = record_decoder.with_quoted_empty_tracking(
+                self.format.delimiter.unwrap_or(b','),
+                quote,
+                self.format.escape,
+                self.format.comment,
+                self.format.terminator,
+            );
+        }
 
         let header = self.format.header as usize;
 
@@ -1385,6 +1444,24 @@ impl ReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_large_exact_null_value_set() {
+        let values = (0..32).map(|index| format!("NULL_{index}")).collect();
+        let matcher = NullRegex::from_values(values);
+        assert!(matcher.is_null("NULL_31"));
+        assert!(!matcher.is_null("NULL_32"));
+    }
+
+    #[test]
+    fn test_quoted_empty_inference_requires_schema() {
+        let error = Format::default()
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .infer_schema(Cursor::new("\"\"\n"), None)
+            .unwrap_err();
+        assert!(error.to_string().contains("explicit CSV schema"));
+    }
 
     use std::io::{Cursor, Seek, SeekFrom, Write};
     use tempfile::NamedTempFile;
@@ -2607,6 +2684,210 @@ mod tests {
             Err(ArrowError::CsvError(e)) => e.to_string().contains("incorrect number of fields"),
             _ => false,
         });
+    }
+
+    #[test]
+    fn test_truncated_rows_with_null_regex() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("number", DataType::Int32, true),
+        ]));
+        let reader = ReaderBuilder::new(schema)
+            .with_truncated_rows(true)
+            .with_null_regex(Regex::new("^NA$").unwrap())
+            .with_batch_size(2)
+            .build(Cursor::new("1,,1\n2\n3,NA,3\n4,x,4\n"))
+            .unwrap();
+        let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.len(), 2);
+
+        let text = batches[0].column(1).as_string::<i32>();
+        assert_eq!(text.value(0), "");
+        assert!(!text.is_null(0));
+        assert!(text.is_null(1));
+        let number = batches[0].column(2).as_primitive::<Int32Type>();
+        assert_eq!(number.value(0), 1);
+        assert!(number.is_null(1));
+
+        let text = batches[1].column(1).as_string::<i32>();
+        assert!(text.is_null(0));
+        assert_eq!(text.value(1), "x");
+        let number = batches[1].column(2).as_primitive::<Int32Type>();
+        assert_eq!(number.value(0), 3);
+        assert_eq!(number.value(1), 4);
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_with_null_regex() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let input = std::io::BufReader::with_capacity(
+            2,
+            Cursor::new("1,\n2,\"\"\n3,NA\n4,\\N\n5,\"x,y\"\n"),
+        );
+        let reader = ReaderBuilder::new(schema)
+            .with_quote(b'"')
+            .with_null_values(vec!["NA".to_owned(), String::new()])
+            .with_preserve_quoted_empty(true)
+            .with_batch_size(2)
+            .build_buffered(input)
+            .unwrap();
+        let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.len(), 3);
+
+        let first = batches[0].column(1).as_string::<i32>();
+        assert!(first.is_null(0));
+        assert!(!first.is_null(1));
+        assert_eq!(first.value(1), "");
+
+        let second = batches[1].column(1).as_string::<i32>();
+        assert!(second.is_null(0));
+        assert_eq!(second.value(1), "\\N");
+        assert_eq!(batches[2].column(1).as_string::<i32>().value(0), "x,y");
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_comments_crlf_and_eof() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let input = std::io::BufReader::with_capacity(
+            1,
+            Cursor::new("#comment\r\n1,\"\"\r\n2,\r\n3,\"a\r\nb\"\r\n4,\"\""),
+        );
+        let batches = ReaderBuilder::new(schema)
+            .with_comment(b'#')
+            .with_null_regex(Regex::new("^$").unwrap())
+            .with_preserve_quoted_empty(true)
+            .with_batch_size(2)
+            .build_buffered(input)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(batches.len(), 2);
+        let first = batches[0].column(1).as_string::<i32>();
+        assert_eq!(first.value(0), "");
+        assert!(first.is_null(1));
+        let second = batches[1].column(1).as_string::<i32>();
+        assert_eq!(second.value(0), "a\r\nb");
+        assert_eq!(second.value(1), "");
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_skips_blank_lines_and_comment_cr() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let input =
+            std::io::BufReader::with_capacity(1, Cursor::new("\n#a\rb,c\n\n1,\"\"\n\n2,\n"));
+        let batch = ReaderBuilder::new(schema)
+            .with_comment(b'#')
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .build_buffered(input)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let values = batch.column(1).as_string::<i32>();
+        assert_eq!(values.value(0), "");
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_does_not_escape_unquoted_delimiter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Utf8, false),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        let batch = ReaderBuilder::new(schema)
+            .with_escape(b'\\')
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .build_buffered(Cursor::new("a\\,b\nx,\"\"\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.column(0).as_string::<i32>().value(0), "a\\");
+        let second = batch.column(1).as_string::<i32>();
+        assert_eq!(second.value(0), "b");
+        assert_eq!(second.value(1), "");
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_when_escape_equals_quote() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = ReaderBuilder::new(schema)
+            .with_escape(b'"')
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .build(Cursor::new("1,\"\"\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let values = batch.column(1).as_string::<i32>();
+        assert_eq!(values.value(0), "");
+        assert!(!values.is_null(0));
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_with_nul_quote() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = ReaderBuilder::new(schema)
+            .with_quote(0)
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .build(Cursor::new(b"1,\0\0\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let values = batch.column(1).as_string::<i32>();
+        assert_eq!(values.value(0), "");
+        assert!(!values.is_null(0));
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_custom_terminator_and_truncated_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let input = std::io::BufReader::with_capacity(1, Cursor::new("1;''|2;|3;'x;y'|4;''|5"));
+        let batch = ReaderBuilder::new(schema)
+            .with_delimiter(b';')
+            .with_quote(b'\'')
+            .with_terminator(b'|')
+            .with_truncated_rows(true)
+            .with_null_regex(Regex::new("^$").unwrap())
+            .with_preserve_quoted_empty(true)
+            .build_buffered(input)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        let values = batch.column(1).as_string::<i32>();
+        assert_eq!(values.value(0), "");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), "x;y");
+        assert_eq!(values.value(3), "");
+        assert!(values.is_null(4));
     }
 
     #[test]
