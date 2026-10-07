@@ -28,7 +28,6 @@ struct QuotedEmptyFields {
     escape: Option<u8>,
     comment: Option<u8>,
     terminator: Option<u8>,
-    pending_crlf: bool,
     fields: Vec<u8>,
 }
 
@@ -53,24 +52,23 @@ impl QuotedEmptyFields {
         flags.fill(0);
 
         let mut field = 0;
-        let mut start = usize::from(self.pending_crlf && raw.first() == Some(&b'\n'));
-        self.pending_crlf = false;
+        let mut start = 0;
         let mut in_quotes = false;
         let mut terminated = false;
-        let mut i = start;
+        let mut i = 0;
         while i < raw.len() {
             let byte = raw[i];
+            if field == 0
+                && i == start
+                && (self.terminator.is_some_and(|term| byte == term)
+                    || (self.terminator.is_none() && (byte == b'\n' || byte == b'\r')))
+            {
+                i += 1;
+                start = i;
+                continue;
+            }
             if field == 0 && i == start && Some(byte) == self.comment {
-                while i < raw.len()
-                    && !self.terminator.is_some_and(|term| raw[i] == term)
-                    && (self.terminator.is_some() || (raw[i] != b'\n' && raw[i] != b'\r'))
-                {
-                    i += 1;
-                }
-                if self.terminator.is_none()
-                    && raw.get(i) == Some(&b'\r')
-                    && raw.get(i + 1) == Some(&b'\n')
-                {
+                while i < raw.len() && raw[i] != b'\n' {
                     i += 1;
                 }
                 i += usize::from(i < raw.len());
@@ -91,9 +89,6 @@ impl QuotedEmptyFields {
                 }
             } else if i == start && byte == self.quote {
                 in_quotes = true;
-            } else if Some(byte) == self.escape && i + 1 < raw.len() {
-                i += 2;
-                continue;
             } else if byte == self.delimiter
                 || self.terminator.is_some_and(|term| byte == term)
                 || (self.terminator.is_none() && (byte == b'\n' || byte == b'\r'))
@@ -107,7 +102,6 @@ impl QuotedEmptyFields {
                 if self.terminator.is_some_and(|term| byte == term)
                     || (self.terminator.is_none() && (byte == b'\n' || byte == b'\r'))
                 {
-                    self.pending_crlf = self.terminator.is_none() && byte == b'\r';
                     terminated = true;
                     break;
                 }
@@ -248,7 +242,6 @@ impl RecordDecoder {
             escape,
             comment,
             terminator,
-            pending_crlf: false,
             fields: Vec::new(),
         });
         self

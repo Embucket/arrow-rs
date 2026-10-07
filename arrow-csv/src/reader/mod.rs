@@ -244,9 +244,18 @@ enum NullRegex {
     Empty,
     Regex(Regex),
     Exact(Vec<String>),
+    ExactSet(std::collections::HashSet<String>),
 }
 
 impl NullRegex {
+    fn from_values(values: Vec<String>) -> Self {
+        if values.len() > 8 {
+            Self::ExactSet(values.into_iter().collect())
+        } else {
+            Self::Exact(values)
+        }
+    }
+
     /// Returns true if the value should be considered as `NULL` according to
     /// the provided regular expression.
     #[inline]
@@ -255,6 +264,7 @@ impl NullRegex {
             Self::Empty => s.is_empty(),
             Self::Regex(r) => r.is_match(s),
             Self::Exact(values) => values.iter().any(|value| value == s),
+            Self::ExactSet(values) => values.contains(s),
         }
     }
 }
@@ -389,11 +399,14 @@ impl Format {
 
     /// Match exact CSV null values without a regex check for every field.
     pub fn with_null_values(mut self, values: Vec<String>) -> Self {
-        self.null_regex = NullRegex::Exact(values);
+        self.null_regex = NullRegex::from_values(values);
         self
     }
 
     /// Keep quoted empty fields distinct from unquoted empty fields when matching nulls.
+    ///
+    /// Schema inference is not available when the null matcher includes an empty
+    /// field: use [`ReaderBuilder`] with an explicit schema in that case.
     pub fn with_preserve_quoted_empty(mut self, preserve: bool) -> Self {
         self.preserve_quoted_empty = preserve;
         self
@@ -421,6 +434,11 @@ impl Format {
         reader: R,
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
+        if self.preserve_quoted_empty && self.null_regex.is_null("") {
+            return Err(ArrowError::CsvError(
+                "quoted-empty preservation requires an explicit CSV schema".to_owned(),
+            ));
+        }
         let mut csv_reader = self.build_reader(reader);
 
         // get or create header names
@@ -1317,7 +1335,7 @@ impl ReaderBuilder {
 
     /// Match exact CSV null values without a regex check for every field.
     pub fn with_null_values(mut self, values: Vec<String>) -> Self {
-        self.format.null_regex = NullRegex::Exact(values);
+        self.format.null_regex = NullRegex::from_values(values);
         self
     }
 
@@ -1428,6 +1446,24 @@ impl ReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_large_exact_null_value_set() {
+        let values = (0..32).map(|index| format!("NULL_{index}")).collect();
+        let matcher = NullRegex::from_values(values);
+        assert!(matcher.is_null("NULL_31"));
+        assert!(!matcher.is_null("NULL_32"));
+    }
+
+    #[test]
+    fn test_quoted_empty_inference_requires_schema() {
+        let error = Format::default()
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .infer_schema(Cursor::new("\"\"\n"), None)
+            .unwrap_err();
+        assert!(error.to_string().contains("explicit CSV schema"));
+    }
 
     use std::io::{Cursor, Seek, SeekFrom, Write};
     use tempfile::NamedTempFile;
@@ -2741,6 +2777,50 @@ mod tests {
         assert!(first.is_null(1));
         let second = batches[1].column(1).as_string::<i32>();
         assert_eq!(second.value(0), "a\r\nb");
+        assert_eq!(second.value(1), "");
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_skips_blank_lines_and_comment_cr() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let input =
+            std::io::BufReader::with_capacity(1, Cursor::new("\n#a\rb,c\n\n1,\"\"\n\n2,\n"));
+        let batch = ReaderBuilder::new(schema)
+            .with_comment(b'#')
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .build_buffered(input)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let values = batch.column(1).as_string::<i32>();
+        assert_eq!(values.value(0), "");
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_does_not_escape_unquoted_delimiter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Utf8, false),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        let batch = ReaderBuilder::new(schema)
+            .with_escape(b'\\')
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .build_buffered(Cursor::new("a\\,b\nx,\"\"\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.column(0).as_string::<i32>().value(0), "a\\");
+        let second = batch.column(1).as_string::<i32>();
+        assert_eq!(second.value(0), "b");
         assert_eq!(second.value(1), "");
     }
 
