@@ -58,6 +58,9 @@ pub struct RecordDecoder {
     /// The number of rows buffered
     num_rows: usize,
 
+    /// Actual field counts, retained only when short rows are allowed
+    field_counts: Option<Vec<usize>>,
+
     /// Decoded field data
     data: Vec<u8>,
 
@@ -99,6 +102,7 @@ impl RecordDecoder {
             data_len: 0,
             data: vec![],
             num_rows: 0,
+            field_counts: truncated_rows.then(Vec::new),
             truncated_rows,
             record_error_handler: None,
             record_bytes: vec![],
@@ -196,6 +200,13 @@ impl RecordDecoder {
                                     "incorrect number of fields for line {}, expected {} got {}",
                                     self.line_number, self.num_columns, self.current_field
                                 )));
+                            }
+                        }
+                        if let Some(counts) = &mut self.field_counts {
+                            if counts.len() == self.num_rows {
+                                counts.push(self.current_field);
+                            } else {
+                                counts[self.num_rows] = self.current_field;
                             }
                         }
                         read += 1;
@@ -323,6 +334,13 @@ impl RecordDecoder {
                                 .fill(fill_value);
                             self.offsets_len += fill_count;
                         }
+                        if let Some(counts) = &mut self.field_counts {
+                            if counts.len() == self.num_rows {
+                                counts.push(self.current_field);
+                            } else {
+                                counts[self.num_rows] = self.current_field;
+                            }
+                        }
                         read += 1;
                         self.current_field = 0;
                         self.line_number += 1;
@@ -411,6 +429,7 @@ impl RecordDecoder {
 
         let offsets = &self.offsets[..self.offsets_len];
         let num_rows = self.num_rows;
+        let field_counts = self.field_counts.as_ref().map(|counts| &counts[..num_rows]);
 
         // Reset state
         self.offsets_len = 1;
@@ -423,6 +442,7 @@ impl RecordDecoder {
             num_rows,
             num_columns: self.num_columns,
             offsets,
+            field_counts,
             data,
         })
     }
@@ -440,6 +460,7 @@ pub struct StringRecords<'a> {
     num_columns: usize,
     num_rows: usize,
     offsets: &'a [usize],
+    field_counts: Option<&'a [usize]>,
     data: &'a str,
 }
 
@@ -449,6 +470,7 @@ impl<'a> StringRecords<'a> {
         StringRecord {
             data: self.data,
             offsets: &self.offsets[field_idx..field_idx + self.num_columns + 1],
+            field_count: self.field_counts.map(|counts| counts[index]),
         }
     }
 
@@ -466,9 +488,15 @@ impl<'a> StringRecords<'a> {
 pub struct StringRecord<'a> {
     data: &'a str,
     offsets: &'a [usize],
+    field_count: Option<usize>,
 }
 
 impl<'a> StringRecord<'a> {
+    #[inline]
+    pub fn is_missing(&self, index: usize) -> bool {
+        self.field_count.is_some_and(|count| index >= count)
+    }
+
     pub fn get(&self, index: usize) -> &'a str {
         let end = self.offsets[index + 1];
         let start = self.offsets[index];
@@ -732,6 +760,39 @@ mod tests {
         let (read, bytes) = decoder.decode(csv.as_bytes(), 5).unwrap();
         assert_eq!(read, 5);
         assert_eq!(bytes, csv.len());
+
+        let records = decoder.flush().unwrap();
+        let missing = records
+            .iter()
+            .map(|record| record.is_missing(1))
+            .collect::<Vec<_>>();
+        assert_eq!(missing, [false, true, false, false, false]);
+        assert_eq!(records.get(1).get(1), "");
+        assert_eq!(records.get(2).get(0), "");
+    }
+
+    #[test]
+    fn test_truncated_rows_with_error_handler() {
+        let csv = b"1,ok\n2,extra,value\n3\n4,after\n";
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder =
+            RecordDecoder::new(Reader::new(), 2, true).with_record_error_handler(Some(handler));
+        let (read, bytes) = decoder.decode(csv, 2).unwrap();
+        assert_eq!(read, 2);
+
+        let records = decoder.flush().unwrap();
+        let values = records
+            .iter()
+            .map(|record| (record.get(0).to_owned(), record.is_missing(1)))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [("1".into(), false), ("3".into(), true)]);
+
+        let (read, remaining_bytes) = decoder.decode(&csv[bytes..], 2).unwrap();
+        assert_eq!(read, 1);
+        assert_eq!(bytes + remaining_bytes, csv.len());
+        let records = decoder.flush().unwrap();
+        assert_eq!(records.get(0).get(0), "4");
+        assert!(!records.get(0).is_missing(1));
     }
 
     /// Regression test for an overflow path found by the `arrow-csv`

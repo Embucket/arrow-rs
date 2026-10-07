@@ -913,7 +913,7 @@ fn parse(
                     rows.iter()
                         .map(|row| {
                             let s = row.get(i);
-                            (!null_regex.is_null(s)).then_some(s)
+                            (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                         })
                         .collect::<StringArray>(),
                 ) as ArrayRef),
@@ -921,7 +921,7 @@ fn parse(
                     rows.iter()
                         .map(|row| {
                             let s = row.get(i);
-                            (!null_regex.is_null(s)).then_some(s)
+                            (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                         })
                         .collect::<StringViewArray>(),
                 ) as ArrayRef),
@@ -933,7 +933,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<Int8Type>>(),
                         ) as ArrayRef),
@@ -941,7 +941,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<Int16Type>>(),
                         ) as ArrayRef),
@@ -949,7 +949,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<Int32Type>>(),
                         ) as ArrayRef),
@@ -957,7 +957,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<Int64Type>>(),
                         ) as ArrayRef),
@@ -965,7 +965,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<UInt8Type>>(),
                         ) as ArrayRef),
@@ -973,7 +973,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<UInt16Type>>(),
                         ) as ArrayRef),
@@ -981,7 +981,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<UInt32Type>>(),
                         ) as ArrayRef),
@@ -989,7 +989,7 @@ fn parse(
                             rows.iter()
                                 .map(|row| {
                                     let s = row.get(i);
-                                    (!null_regex.is_null(s)).then_some(s)
+                                    (!row.is_missing(i) && !null_regex.is_null(s)).then_some(s)
                                 })
                                 .collect::<DictionaryArray<UInt64Type>>(),
                         ) as ArrayRef),
@@ -1045,7 +1045,7 @@ fn build_decimal_array<T: DecimalType>(
     let mut decimal_builder = PrimitiveBuilder::<T>::with_capacity(rows.len());
     for row in rows.iter() {
         let s = row.get(col_idx);
-        if null_regex.is_null(s) {
+        if row.is_missing(col_idx) || null_regex.is_null(s) {
             // append null
             decimal_builder.append_null();
         } else {
@@ -1078,7 +1078,7 @@ fn build_primitive_array<T: ArrowPrimitiveType + Parser>(
         .enumerate()
         .map(|(row_index, row)| {
             let s = row.get(col_idx);
-            if null_regex.is_null(s) {
+            if row.is_missing(col_idx) || null_regex.is_null(s) {
                 return Ok(None);
             }
 
@@ -1127,7 +1127,7 @@ fn build_timestamp_array_impl<T: ArrowTimestampType, Tz: TimeZone>(
         .enumerate()
         .map(|(row_index, row)| {
             let s = row.get(col_idx);
-            if null_regex.is_null(s) {
+            if row.is_missing(col_idx) || null_regex.is_null(s) {
                 return Ok(None);
             }
 
@@ -1166,7 +1166,7 @@ fn build_boolean_array(
         .enumerate()
         .map(|(row_index, row)| {
             let s = row.get(col_idx);
-            if null_regex.is_null(s) {
+            if row.is_missing(col_idx) || null_regex.is_null(s) {
                 return Ok(None);
             }
             let parsed = parse_bool(s);
@@ -2607,6 +2607,38 @@ mod tests {
             Err(ArrowError::CsvError(e)) => e.to_string().contains("incorrect number of fields"),
             _ => false,
         });
+    }
+
+    #[test]
+    fn test_truncated_rows_with_null_regex() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("number", DataType::Int32, true),
+        ]));
+        let reader = ReaderBuilder::new(schema)
+            .with_truncated_rows(true)
+            .with_null_regex(Regex::new("^NA$").unwrap())
+            .with_batch_size(2)
+            .build(Cursor::new("1,,1\n2\n3,NA,3\n4,x,4\n"))
+            .unwrap();
+        let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.len(), 2);
+
+        let text = batches[0].column(1).as_string::<i32>();
+        assert_eq!(text.value(0), "");
+        assert!(!text.is_null(0));
+        assert!(text.is_null(1));
+        let number = batches[0].column(2).as_primitive::<Int32Type>();
+        assert_eq!(number.value(0), 1);
+        assert!(number.is_null(1));
+
+        let text = batches[1].column(1).as_string::<i32>();
+        assert!(text.is_null(0));
+        assert_eq!(text.value(1), "x");
+        let number = batches[1].column(2).as_primitive::<Int32Type>();
+        assert_eq!(number.value(0), 3);
+        assert_eq!(number.value(1), 4);
     }
 
     #[test]
