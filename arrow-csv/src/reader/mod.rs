@@ -1411,15 +1411,13 @@ impl ReaderBuilder {
         .with_record_error_handler(self.record_error_handler);
         if self.format.preserve_quoted_empty {
             let quote = self.format.quote.unwrap_or(b'"');
-            if quote != 0 {
-                record_decoder = record_decoder.with_quoted_empty_tracking(
-                    self.format.delimiter.unwrap_or(b','),
-                    quote,
-                    self.format.escape,
-                    self.format.comment,
-                    self.format.terminator,
-                );
-            }
+            record_decoder = record_decoder.with_quoted_empty_tracking(
+                self.format.delimiter.unwrap_or(b','),
+                quote,
+                self.format.escape,
+                self.format.comment,
+                self.format.terminator,
+            );
         }
 
         let header = self.format.header as usize;
@@ -2822,6 +2820,46 @@ mod tests {
         let second = batch.column(1).as_string::<i32>();
         assert_eq!(second.value(0), "b");
         assert_eq!(second.value(1), "");
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_when_escape_equals_quote() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = ReaderBuilder::new(schema)
+            .with_escape(b'"')
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .build(Cursor::new("1,\"\"\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let values = batch.column(1).as_string::<i32>();
+        assert_eq!(values.value(0), "");
+        assert!(!values.is_null(0));
+    }
+
+    #[test]
+    fn test_preserve_quoted_empty_with_nul_quote() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = ReaderBuilder::new(schema)
+            .with_quote(0)
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .build(Cursor::new(b"1,\0\0\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let values = batch.column(1).as_string::<i32>();
+        assert_eq!(values.value(0), "");
+        assert!(!values.is_null(0));
     }
 
     #[test]

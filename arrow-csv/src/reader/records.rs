@@ -76,16 +76,15 @@ impl QuotedEmptyFields {
                 continue;
             }
             if in_quotes {
-                if Some(byte) == self.escape && i + 1 < raw.len() {
-                    i += 2;
-                    continue;
-                }
                 if byte == self.quote {
                     if raw.get(i + 1) == Some(&self.quote) {
                         i += 2;
                         continue;
                     }
                     in_quotes = false;
+                } else if Some(byte) == self.escape && i + 1 < raw.len() {
+                    i += 2;
+                    continue;
                 }
             } else if i == start && byte == self.quote {
                 in_quotes = true;
