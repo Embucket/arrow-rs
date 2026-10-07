@@ -175,7 +175,7 @@ use csv::StringRecord;
 use regex::{Regex, RegexSet};
 use std::fmt::{self, Debug};
 use std::fs::File;
-use std::io::{BufRead, BufReader as StdBufReader, Read};
+use std::io::{self, BufRead, BufReader as StdBufReader, Cursor, Read};
 use std::sync::{Arc, LazyLock};
 
 use crate::map_csv_error;
@@ -405,8 +405,9 @@ impl Format {
 
     /// Keep quoted empty fields distinct from unquoted empty fields when matching nulls.
     ///
-    /// Schema inference is not available when the null matcher includes an empty
-    /// field: use [`ReaderBuilder`] with an explicit schema in that case.
+    /// Inference with this option uses the same field-count validation as the
+    /// CSV reader. In particular, `truncated_rows` allows missing fields but
+    /// not extra fields beyond the inferred header width.
     pub fn with_preserve_quoted_empty(mut self, preserve: bool) -> Self {
         self.preserve_quoted_empty = preserve;
         self
@@ -435,9 +436,7 @@ impl Format {
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
         if self.preserve_quoted_empty && self.null_regex.is_null("") {
-            return Err(ArrowError::CsvError(
-                "quoted-empty preservation requires an explicit CSV schema".to_owned(),
-            ));
+            return self.infer_schema_with_quoted_empty(reader, max_records);
         }
         let mut csv_reader = self.build_reader(reader);
 
@@ -488,6 +487,74 @@ impl Format {
         Ok((Schema::new(fields), records_count))
     }
 
+    fn infer_schema_with_quoted_empty<R: Read>(
+        &self,
+        reader: R,
+        max_records: Option<usize>,
+    ) -> Result<(Schema, usize), ArrowError> {
+        let recording = RecordingReader {
+            inner: reader,
+            prefix: Vec::new(),
+        };
+        let mut header_reader = self.build_reader(recording);
+        let headers: Vec<String> = if self.header {
+            header_reader
+                .headers()
+                .map_err(map_csv_error)?
+                .iter()
+                .map(ToOwned::to_owned)
+                .collect()
+        } else {
+            (0..header_reader.headers().map_err(map_csv_error)?.len())
+                .map(|i| format!("column_{}", i + 1))
+                .collect()
+        };
+        let RecordingReader { inner, prefix } = header_reader.into_inner();
+        let mut column_types: Vec<InferredDataType> = vec![Default::default(); headers.len()];
+        let max_records = max_records.unwrap_or(usize::MAX);
+        if max_records == 0 {
+            return Ok((inferred_schema(&headers, &column_types), 0));
+        }
+
+        let schema = Arc::new(Schema::new(
+            headers
+                .iter()
+                .map(|name| Field::new(name, DataType::Utf8, true))
+                .collect::<Fields>(),
+        ));
+        // Decoder buffers scale with batch_size * column_count, including for short files.
+        let batch_size = max_records
+            .min(1024)
+            .min((65_536 / headers.len().max(1)).max(1));
+        let mut builder = ReaderBuilder::new(schema)
+            .with_format(self.clone())
+            .with_batch_size(batch_size);
+        if max_records != usize::MAX {
+            builder = builder.with_bounds(0, max_records);
+        }
+        let mut csv_reader = builder.build(Cursor::new(prefix).chain(inner))?;
+        let mut records_count = 0;
+        while records_count < max_records {
+            let Some(batch) = csv_reader.next().transpose()? else {
+                break;
+            };
+            records_count += batch.num_rows();
+            for (index, column_type) in column_types.iter_mut().enumerate() {
+                let strings = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        ArrowError::CsvError("CSV inference expected a string column".to_owned())
+                    })?;
+                for value in strings.iter().flatten() {
+                    column_type.update(value);
+                }
+            }
+        }
+        Ok((inferred_schema(&headers, &column_types), records_count))
+    }
+
     /// Build a [`csv::Reader`] for this [`Format`]
     fn build_reader<R: Read>(&self, reader: R) -> csv::Reader<R> {
         let mut builder = csv::ReaderBuilder::new();
@@ -526,6 +593,29 @@ impl Format {
             builder.terminator(csv_core::Terminator::Any(t));
         }
         builder.build()
+    }
+}
+
+fn inferred_schema(headers: &[String], column_types: &[InferredDataType]) -> Schema {
+    Schema::new(
+        column_types
+            .iter()
+            .zip(headers)
+            .map(|(inferred, name)| Field::new(name, inferred.get(), true))
+            .collect::<Fields>(),
+    )
+}
+
+struct RecordingReader<R> {
+    inner: R,
+    prefix: Vec<u8>,
+}
+
+impl<R: Read> Read for RecordingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.prefix.extend_from_slice(&buf[..read]);
+        Ok(read)
     }
 }
 
@@ -1454,13 +1544,111 @@ mod tests {
     }
 
     #[test]
-    fn test_quoted_empty_inference_requires_schema() {
-        let error = Format::default()
+    fn test_quoted_empty_inference_preserves_numeric_and_string_columns() {
+        let format = Format::default()
+            .with_header(true)
+            .with_delimiter(b'|')
+            .with_null_values(vec![String::new(), "NA".to_owned()])
+            .with_preserve_quoted_empty(true);
+        let csv = "ID|NUMBER|QUOTED|MIXED\n1|42|\"\"|3\n2|||\"\"\n3|7|\"\"|5\n";
+        let (schema, records) = format.infer_schema(Cursor::new(csv), None).unwrap();
+        assert_eq!(records, 3);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_quoted_empty_inference_without_header_and_custom_quote() {
+        let (schema, records) = Format::default()
+            .with_delimiter(b';')
+            .with_quote(b'\'')
             .with_null_values(vec![String::new()])
             .with_preserve_quoted_empty(true)
-            .infer_schema(Cursor::new("\"\"\n"), None)
-            .unwrap_err();
-        assert!(error.to_string().contains("explicit CSV schema"));
+            .infer_schema(Cursor::new("'';1\n;2\n"), None)
+            .unwrap();
+        assert_eq!(records, 2);
+        assert_eq!(schema.field(0).name(), "column_1");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn test_quoted_empty_inference_respects_record_limit() {
+        let format = Format::default()
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true);
+        let (schema, records) = format
+            .infer_schema(Cursor::new("\"\"\n1,2\n"), Some(1))
+            .unwrap();
+        assert_eq!(records, 1);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+
+        let (schema, records) = format
+            .infer_schema(Cursor::new("\"\"\n1,2\n"), Some(0))
+            .unwrap();
+        assert_eq!(records, 0);
+        assert_eq!(schema.field(0).data_type(), &DataType::Null);
+    }
+
+    #[test]
+    fn test_quoted_empty_inference_record_limit_across_batches() {
+        let mut csv = "1\n".repeat(1025);
+        csv.push_str("1,2\n");
+        let (schema, records) = Format::default()
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .infer_schema(Cursor::new(csv), Some(1025))
+            .unwrap();
+        assert_eq!(records, 1025);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn test_quoted_empty_inference_wide_short_csv() {
+        let mut csv = (0..10_000)
+            .map(|index| format!("column_{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        csv.push('\n');
+        csv.push_str(&vec!["\"\""; 10_000].join(","));
+        csv.push('\n');
+        let (schema, records) = Format::default()
+            .with_header(true)
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .infer_schema(Cursor::new(csv), None)
+            .unwrap();
+        assert_eq!(records, 1);
+        assert_eq!(schema.fields().len(), 10_000);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(9_999).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_quoted_empty_inference_rejects_extra_fields_with_truncated_rows() {
+        let error = Format::default()
+            .with_header(true)
+            .with_truncated_rows(true)
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .infer_schema(Cursor::new("A\n1,2\n"), None);
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn test_quoted_empty_inference_accepts_missing_fields_with_truncated_rows() {
+        let (schema, records) = Format::default()
+            .with_header(true)
+            .with_truncated_rows(true)
+            .with_null_values(vec![String::new()])
+            .with_preserve_quoted_empty(true)
+            .infer_schema(Cursor::new("A,B\n1\n"), None)
+            .unwrap();
+        assert_eq!(records, 1);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Null);
     }
 
     use std::io::{Cursor, Seek, SeekFrom, Write};
