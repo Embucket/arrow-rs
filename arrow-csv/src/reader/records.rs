@@ -19,7 +19,116 @@ use arrow_schema::ArrowError;
 use csv_core::{ReadRecordResult, Reader};
 use std::sync::Arc;
 
-use super::{CsvRecord, CsvRecordError, CsvRecordErrorHandler};
+use super::{CsvRecord, CsvRecordError, CsvRecordErrorHandler, NullRegex};
+
+#[derive(Debug)]
+struct QuotedEmptyFields {
+    delimiter: u8,
+    quote: u8,
+    escape: Option<u8>,
+    comment: Option<u8>,
+    terminator: Option<u8>,
+    pending_crlf: bool,
+    fields: Vec<u8>,
+}
+
+impl QuotedEmptyFields {
+    fn record(
+        &mut self,
+        row: usize,
+        columns: usize,
+        present_fields: usize,
+        raw: &[u8],
+    ) -> Result<(), ArrowError> {
+        let start = row
+            .checked_mul(columns)
+            .ok_or_else(|| ArrowError::CsvError("CSV quoted-field offset overflowed".to_owned()))?;
+        let end = start
+            .checked_add(columns)
+            .ok_or_else(|| ArrowError::CsvError("CSV quoted-field offset overflowed".to_owned()))?;
+        if self.fields.len() < end {
+            self.fields.resize(end, 0);
+        }
+        let flags = &mut self.fields[start..end];
+        flags.fill(0);
+
+        let mut field = 0;
+        let mut start = usize::from(self.pending_crlf && raw.first() == Some(&b'\n'));
+        self.pending_crlf = false;
+        let mut in_quotes = false;
+        let mut terminated = false;
+        let mut i = start;
+        while i < raw.len() {
+            let byte = raw[i];
+            if field == 0 && i == start && Some(byte) == self.comment {
+                while i < raw.len()
+                    && !self.terminator.is_some_and(|term| raw[i] == term)
+                    && (self.terminator.is_some() || (raw[i] != b'\n' && raw[i] != b'\r'))
+                {
+                    i += 1;
+                }
+                if self.terminator.is_none()
+                    && raw.get(i) == Some(&b'\r')
+                    && raw.get(i + 1) == Some(&b'\n')
+                {
+                    i += 1;
+                }
+                i += usize::from(i < raw.len());
+                start = i;
+                continue;
+            }
+            if in_quotes {
+                if Some(byte) == self.escape && i + 1 < raw.len() {
+                    i += 2;
+                    continue;
+                }
+                if byte == self.quote {
+                    if raw.get(i + 1) == Some(&self.quote) {
+                        i += 2;
+                        continue;
+                    }
+                    in_quotes = false;
+                }
+            } else if i == start && byte == self.quote {
+                in_quotes = true;
+            } else if Some(byte) == self.escape && i + 1 < raw.len() {
+                i += 2;
+                continue;
+            } else if byte == self.delimiter
+                || self.terminator.is_some_and(|term| byte == term)
+                || (self.terminator.is_none() && (byte == b'\n' || byte == b'\r'))
+            {
+                let flag = flags.get_mut(field).ok_or_else(|| {
+                    ArrowError::CsvError("CSV quoted-field count exceeds schema".to_owned())
+                })?;
+                *flag = u8::from(raw[start..i] == [self.quote, self.quote]);
+                field += 1;
+                start = i + 1;
+                if self.terminator.is_some_and(|term| byte == term)
+                    || (self.terminator.is_none() && (byte == b'\n' || byte == b'\r'))
+                {
+                    self.pending_crlf = self.terminator.is_none() && byte == b'\r';
+                    terminated = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if !terminated {
+            let flag = flags.get_mut(field).ok_or_else(|| {
+                ArrowError::CsvError("CSV quoted-field count exceeds schema".to_owned())
+            })?;
+            *flag = u8::from(raw[start..] == [self.quote, self.quote]);
+            field += 1;
+        }
+        if field != present_fields {
+            return Err(ArrowError::CsvError(format!(
+                "CSV quoted-field count mismatch, expected {present_fields} got {field}"
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// The estimated length of a field in bytes
 const AVERAGE_FIELD_SIZE: usize = 8;
@@ -60,6 +169,9 @@ pub struct RecordDecoder {
 
     /// Actual field counts, retained only when short rows are allowed
     field_counts: Option<Vec<usize>>,
+
+    /// Quoted-empty flags, retained only when the caller needs that distinction
+    quoted_empty: Option<QuotedEmptyFields>,
 
     /// Decoded field data
     data: Vec<u8>,
@@ -103,6 +215,7 @@ impl RecordDecoder {
             data: vec![],
             num_rows: 0,
             field_counts: truncated_rows.then(Vec::new),
+            quoted_empty: None,
             truncated_rows,
             record_error_handler: None,
             record_bytes: vec![],
@@ -118,6 +231,26 @@ impl RecordDecoder {
         handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     ) -> Self {
         self.record_error_handler = handler;
+        self
+    }
+
+    pub fn with_quoted_empty_tracking(
+        mut self,
+        delimiter: u8,
+        quote: u8,
+        escape: Option<u8>,
+        comment: Option<u8>,
+        terminator: Option<u8>,
+    ) -> Self {
+        self.quoted_empty = Some(QuotedEmptyFields {
+            delimiter,
+            quote,
+            escape,
+            comment,
+            terminator,
+            pending_crlf: false,
+            fields: Vec::new(),
+        });
         self
     }
 
@@ -148,6 +281,7 @@ impl RecordDecoder {
 
         // The current offset into `input`
         let mut input_offset = 0;
+        let mut record_start = 0;
 
         // The number of rows decoded in this pass
         let mut read = 0;
@@ -176,6 +310,10 @@ impl RecordDecoder {
                 match result {
                     ReadRecordResult::End | ReadRecordResult::InputEmpty => {
                         // Reached end of input
+                        if self.quoted_empty.is_some() {
+                            self.record_bytes
+                                .extend_from_slice(&input[record_start..input_offset]);
+                        }
                         return Ok((read, input_offset));
                     }
                     // Need to allocate more capacity
@@ -209,6 +347,27 @@ impl RecordDecoder {
                                 counts[self.num_rows] = self.current_field;
                             }
                         }
+                        if let Some(quoted) = &mut self.quoted_empty {
+                            if self.record_bytes.is_empty() {
+                                quoted.record(
+                                    self.num_rows,
+                                    self.num_columns,
+                                    self.current_field,
+                                    &input[record_start..input_offset],
+                                )?;
+                            } else {
+                                self.record_bytes
+                                    .extend_from_slice(&input[record_start..input_offset]);
+                                quoted.record(
+                                    self.num_rows,
+                                    self.num_columns,
+                                    self.current_field,
+                                    &self.record_bytes,
+                                )?;
+                                self.record_bytes.clear();
+                            }
+                        }
+                        record_start = input_offset;
                         read += 1;
                         self.current_field = 0;
                         self.line_number += 1;
@@ -341,6 +500,14 @@ impl RecordDecoder {
                                 counts[self.num_rows] = self.current_field;
                             }
                         }
+                        if let Some(quoted) = &mut self.quoted_empty {
+                            quoted.record(
+                                self.num_rows,
+                                self.num_columns,
+                                self.current_field,
+                                &self.record_bytes,
+                            )?;
+                        }
                         read += 1;
                         self.current_field = 0;
                         self.line_number += 1;
@@ -430,6 +597,10 @@ impl RecordDecoder {
         let offsets = &self.offsets[..self.offsets_len];
         let num_rows = self.num_rows;
         let field_counts = self.field_counts.as_ref().map(|counts| &counts[..num_rows]);
+        let quoted_empty = self
+            .quoted_empty
+            .as_ref()
+            .map(|quoted| &quoted.fields[..self.offsets_len - 1]);
 
         // Reset state
         self.offsets_len = 1;
@@ -443,6 +614,7 @@ impl RecordDecoder {
             num_columns: self.num_columns,
             offsets,
             field_counts,
+            quoted_empty,
             data,
         })
     }
@@ -461,6 +633,7 @@ pub struct StringRecords<'a> {
     num_rows: usize,
     offsets: &'a [usize],
     field_counts: Option<&'a [usize]>,
+    quoted_empty: Option<&'a [u8]>,
     data: &'a str,
 }
 
@@ -471,6 +644,9 @@ impl<'a> StringRecords<'a> {
             data: self.data,
             offsets: &self.offsets[field_idx..field_idx + self.num_columns + 1],
             field_count: self.field_counts.map(|counts| counts[index]),
+            quoted_empty: self
+                .quoted_empty
+                .map(|flags| &flags[field_idx..field_idx + self.num_columns]),
         }
     }
 
@@ -489,12 +665,20 @@ pub struct StringRecord<'a> {
     data: &'a str,
     offsets: &'a [usize],
     field_count: Option<usize>,
+    quoted_empty: Option<&'a [u8]>,
 }
 
 impl<'a> StringRecord<'a> {
     #[inline]
     pub fn is_missing(&self, index: usize) -> bool {
         self.field_count.is_some_and(|count| index >= count)
+    }
+
+    #[inline]
+    pub(super) fn is_null(&self, index: usize, value: &str, null_regex: &NullRegex) -> bool {
+        self.is_missing(index)
+            || (!self.quoted_empty.is_some_and(|flags| flags[index] != 0)
+                && null_regex.is_null(value))
     }
 
     pub fn get(&self, index: usize) -> &'a str {
