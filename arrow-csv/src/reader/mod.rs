@@ -1559,14 +1559,15 @@ fn build_boolean_array<const NUMERIC: bool>(
             if row.is_null(col_idx, s, null_regex) {
                 return Ok(None);
             }
-            let parsed = if NUMERIC {
+            let parsed = parse_bool(s);
+            let parsed = if NUMERIC && parsed.is_none() {
                 match s {
                     "1" => Some(true),
                     "0" => Some(false),
-                    _ => parse_bool(s),
+                    _ => None,
                 }
             } else {
-                parse_bool(s)
+                parsed
             };
             match parsed {
                 Some(e) => Ok(Some(e)),
