@@ -287,6 +287,7 @@ struct InferredDataType {
     max_integral_digits: u8,
     max_scale: u8,
     first_snowflake_type: u16,
+    snowflake_non_boolean_numeric: bool,
 }
 
 /// Ordered, per-column CSV inference state. Merge states in file order to
@@ -303,6 +304,7 @@ impl SnowflakeCsvTypeState {
         self.0.packed |= later.0.packed;
         self.0.max_integral_digits = self.0.max_integral_digits.max(later.0.max_integral_digits);
         self.0.max_scale = self.0.max_scale.max(later.0.max_scale);
+        self.0.snowflake_non_boolean_numeric |= later.0.snowflake_non_boolean_numeric;
     }
 
     /// Return the type inferred from all states merged so far.
@@ -364,6 +366,12 @@ impl InferredDataType {
 
     fn get_snowflake(&self) -> DataType {
         const TIMESTAMP_TYPES: u16 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+        if self.first_snowflake_type == 1
+            && self.packed == 0b11
+            && !self.snowflake_non_boolean_numeric
+        {
+            return DataType::Boolean;
+        }
         if (self.first_snowflake_type == (1 << 1) && self.packed & (1 << 2) != 0)
             || (self.first_snowflake_type & TIMESTAMP_TYPES != 0 && self.packed & (1 << 3) != 0)
         {
@@ -390,6 +398,9 @@ impl InferredDataType {
 
     fn update_decimal<const SNOWFLAKE: bool>(&mut self, string: &str) -> u16 {
         if let Some((integral_digits, scale)) = decimal_shape(string) {
+            if SNOWFLAKE && string != "0" && string != "1" {
+                self.snowflake_non_boolean_numeric = true;
+            }
             let precision = if SNOWFLAKE {
                 integral_digits.max(1) + scale
             } else {
@@ -1911,6 +1922,44 @@ mod tests {
             .unwrap();
         assert_eq!(records, 3);
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_snowflake_ordered_boolean_numeric_inference() {
+        let cases = [
+            ("true", "1", DataType::Boolean),
+            ("true", "0", DataType::Boolean),
+            ("false", "1", DataType::Boolean),
+            ("1", "true", DataType::Utf8),
+            ("0", "true", DataType::Utf8),
+            ("true", "2", DataType::Utf8),
+            ("2", "true", DataType::Utf8),
+            ("true", "1.0", DataType::Utf8),
+            ("1.0", "true", DataType::Utf8),
+            ("true", "-1", DataType::Utf8),
+        ];
+        let format = Format::default().with_header(true);
+        for (first, later, expected) in cases {
+            let csv = format!("VALUE\n{first}\n{later}\n");
+            let (schema, _, _) = format
+                .infer_schema_with_snowflake_types(Cursor::new(&csv), None)
+                .unwrap();
+            assert_eq!(schema.field(0).data_type(), &expected, "{csv}");
+
+            let (_, mut first_state, _) = format
+                .infer_schema_with_snowflake_types(Cursor::new(format!("VALUE\n{first}\n")), None)
+                .unwrap();
+            let (_, later_state, _) = format
+                .infer_schema_with_snowflake_types(Cursor::new(format!("VALUE\n{later}\n")), None)
+                .unwrap();
+            first_state[0].merge(&later_state[0]);
+            assert_eq!(first_state[0].data_type(), expected, "{csv}");
+        }
+
+        let (default, _) = format
+            .infer_schema(Cursor::new("VALUE\ntrue\n1\n"), None)
+            .unwrap();
+        assert_eq!(default.field(0).data_type(), &DataType::Utf8);
     }
 
     #[test]
