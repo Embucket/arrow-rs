@@ -1054,6 +1054,9 @@ pub struct Decoder {
 
     /// Check if the string matches this pattern for `NULL`.
     null_regex: NullRegex,
+
+    /// Accept numeric Boolean literals in addition to true and false.
+    numeric_boolean_values: bool,
 }
 
 impl Decoder {
@@ -1114,6 +1117,7 @@ impl Decoder {
             self.projection.as_ref(),
             self.line_number,
             &self.null_regex,
+            self.numeric_boolean_values,
         )?;
         self.line_number += rows.len();
         Ok(Some(batch))
@@ -1151,6 +1155,7 @@ fn parse(
     projection: Option<&Vec<usize>>,
     line_number: usize,
     null_regex: &NullRegex,
+    numeric_boolean_values: bool,
 ) -> Result<RecordBatch, ArrowError> {
     let projection: Vec<usize> = match projection {
         Some(v) => v.clone(),
@@ -1163,7 +1168,13 @@ fn parse(
             let i = *i;
             let field = &fields[i];
             match field.data_type() {
-                DataType::Boolean => build_boolean_array(line_number, rows, i, null_regex),
+                DataType::Boolean => {
+                    if numeric_boolean_values {
+                        build_boolean_array::<true>(line_number, rows, i, null_regex)
+                    } else {
+                        build_boolean_array::<false>(line_number, rows, i, null_regex)
+                    }
+                }
                 DataType::Decimal32(precision, scale) => build_decimal_array::<Decimal32Type>(
                     line_number,
                     rows,
@@ -1535,7 +1546,7 @@ fn build_timestamp_array_impl<T: ArrowTimestampType, Tz: TimeZone>(
 }
 
 // parses a specific column (col_idx) into an Arrow Array.
-fn build_boolean_array(
+fn build_boolean_array<const NUMERIC: bool>(
     line_number: usize,
     rows: &StringRecords<'_>,
     col_idx: usize,
@@ -1548,7 +1559,15 @@ fn build_boolean_array(
             if row.is_null(col_idx, s, null_regex) {
                 return Ok(None);
             }
-            let parsed = parse_bool(s);
+            let parsed = if NUMERIC {
+                match s {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => parse_bool(s),
+                }
+            } else {
+                parse_bool(s)
+            };
             match parsed {
                 Some(e) => Ok(Some(e)),
                 None => Err(ArrowError::ParseError(format!(
@@ -1583,6 +1602,7 @@ pub struct ReaderBuilder {
     projection: Option<Vec<usize>>,
     /// Optional handler for records whose field count differs from the schema.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
+    numeric_boolean_values: bool,
 }
 
 impl ReaderBuilder {
@@ -1616,6 +1636,7 @@ impl ReaderBuilder {
             bounds: None,
             projection: None,
             record_error_handler: None,
+            numeric_boolean_values: false,
         }
     }
 
@@ -1717,6 +1738,13 @@ impl ReaderBuilder {
         self
     }
 
+    /// Accept exact `0` and `1` values in Boolean columns in addition to `false` and `true`.
+    /// Disabled by default to preserve the strict CSV reader behavior.
+    pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
+        self.numeric_boolean_values = allow;
+        self
+    }
+
     /// Skip records whose field count differs from the schema and report them to `handler`.
     ///
     /// The default strict path does not retain raw record bytes and is unchanged when no
@@ -1779,6 +1807,7 @@ impl ReaderBuilder {
             projection: self.projection,
             batch_size: self.batch_size,
             null_regex: self.format.null_regex,
+            numeric_boolean_values: self.numeric_boolean_values,
         }
     }
 }
@@ -3141,6 +3170,49 @@ mod tests {
         assert_eq!(None, parse_bool("f"));
         assert_eq!(None, parse_bool("F"));
         assert_eq!(None, parse_bool(""));
+    }
+
+    #[test]
+    fn test_numeric_boolean_values_are_opt_in() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            false,
+        )]));
+        let values = "true\n1\n0\nFALSE\n";
+        let strict_error = ReaderBuilder::new(Arc::clone(&schema))
+            .build(Cursor::new(values))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            strict_error
+                .to_string()
+                .contains("value '1' as type 'Boolean'")
+        );
+
+        let batch = ReaderBuilder::new(Arc::clone(&schema))
+            .with_numeric_boolean_values(true)
+            .build(Cursor::new(values))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let flags = batch.column(0).as_boolean();
+        assert_eq!(
+            flags.values().iter().collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+
+        let invalid = ReaderBuilder::new(schema)
+            .with_numeric_boolean_values(true)
+            .build(Cursor::new("2\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(invalid.to_string().contains("value '2' as type 'Boolean'"));
     }
 
     #[test]
