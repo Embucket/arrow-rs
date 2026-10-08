@@ -286,6 +286,8 @@ struct InferredDataType {
     packed: u16,
     max_integral_digits: u8,
     max_scale: u8,
+    first_snowflake_type: u16,
+    snowflake_type_conflict: bool,
 }
 
 /// Field metadata set by decimal CSV inference when all observed numeric
@@ -339,26 +341,56 @@ impl InferredDataType {
         self.get()
     }
 
-    fn update_decimal(&mut self, string: &str) {
+    fn get_snowflake(&self) -> DataType {
+        if self.snowflake_type_conflict {
+            return DataType::Utf8;
+        }
+        const TEMPORAL_TYPES: u16 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+        if self.first_snowflake_type == (1 << 3) && self.packed & !TEMPORAL_TYPES == 0 {
+            return DataType::Date32;
+        }
+        self.get_decimal()
+    }
+
+    fn update_snowflake(&mut self, string: &str) {
+        let value_type = self.update_decimal::<true>(string);
+        const TIMESTAMP_TYPES: u16 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+        if self.first_snowflake_type == 0 {
+            self.first_snowflake_type = value_type;
+        } else if (self.first_snowflake_type == (1 << 1) && value_type == (1 << 2))
+            || (self.first_snowflake_type & TIMESTAMP_TYPES != 0 && value_type == (1 << 3))
+        {
+            self.snowflake_type_conflict = true;
+        }
+    }
+
+    fn update_decimal<const SNOWFLAKE: bool>(&mut self, string: &str) -> u16 {
         if let Some((integral_digits, scale)) = decimal_shape(string) {
-            let precision = integral_digits + scale;
+            let precision = if SNOWFLAKE {
+                integral_digits.max(1) + scale
+            } else {
+                integral_digits + scale
+            };
             if precision > 38 {
                 self.packed |= 1 << 2; // Float64 for numbers outside Decimal128's range.
+                1 << 2
             } else {
                 self.packed |= 1 << 1;
                 self.max_integral_digits = self.max_integral_digits.max(integral_digits as u8);
                 self.max_scale = self.max_scale.max(scale as u8);
+                1 << 1
             }
         } else if string.is_ascii() {
-            self.update(string);
+            self.update(string)
         } else {
             self.packed |= 1 << 8; // Unicode digits are not parsed by Decimal128.
+            1 << 8
         }
     }
 
     /// Updates the [`InferredDataType`] with the given string
-    fn update(&mut self, string: &str) {
-        self.packed |= if string.starts_with('"') {
+    fn update(&mut self, string: &str) -> u16 {
+        let value_type = if string.starts_with('"') {
             1 << 8 // Utf8
         } else if let Some(m) = REGEX_SET.matches(string).into_iter().next() {
             if m == 1 && string.len() >= 19 && string.parse::<i64>().is_err() {
@@ -371,7 +403,9 @@ impl InferredDataType {
             1 << 2 // Float64
         } else {
             1 << 8 // Utf8
-        }
+        };
+        self.packed |= value_type;
+        value_type
     }
 }
 
@@ -512,7 +546,7 @@ impl Format {
         reader: R,
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
-        self.infer_schema_impl::<R, false>(reader, max_records)
+        self.infer_schema_impl::<R, false, false>(reader, max_records)
     }
 
     /// Infer fixed-point CSV values as `Decimal128(precision, scale)` instead
@@ -523,16 +557,27 @@ impl Format {
         reader: R,
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
-        self.infer_schema_impl::<R, true>(reader, max_records)
+        self.infer_schema_impl::<R, true, false>(reader, max_records)
     }
 
-    fn infer_schema_impl<R: Read, const DECIMAL: bool>(
+    /// Infer exact decimals with Snowflake's order-sensitive CSV type promotion.
+    /// This is separate from ordinary and order-independent decimal inference.
+    pub fn infer_schema_with_snowflake_types<R: Read>(
+        &self,
+        reader: R,
+        max_records: Option<usize>,
+    ) -> Result<(Schema, usize), ArrowError> {
+        self.infer_schema_impl::<R, true, true>(reader, max_records)
+    }
+
+    fn infer_schema_impl<R: Read, const DECIMAL: bool, const SNOWFLAKE: bool>(
         &self,
         reader: R,
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
         if self.preserve_quoted_empty && self.null_regex.is_null("") {
-            return self.infer_schema_with_quoted_empty::<R, DECIMAL>(reader, max_records);
+            return self
+                .infer_schema_with_quoted_empty::<R, DECIMAL, SNOWFLAKE>(reader, max_records);
         }
         let mut csv_reader = self.build_reader(reader);
 
@@ -567,8 +612,10 @@ impl Format {
             for (i, column_type) in column_types.iter_mut().enumerate().take(header_length) {
                 if let Some(string) = record.get(i) {
                     if !self.null_regex.is_null(string) {
-                        if DECIMAL {
-                            column_type.update_decimal(string);
+                        if SNOWFLAKE {
+                            column_type.update_snowflake(string);
+                        } else if DECIMAL {
+                            column_type.update_decimal::<false>(string);
                         } else {
                             column_type.update(string);
                         }
@@ -581,13 +628,15 @@ impl Format {
         let fields: Fields = column_types
             .iter()
             .zip(&headers)
-            .map(|(inferred, field_name)| inferred_field::<DECIMAL>(field_name, inferred))
+            .map(|(inferred, field_name)| {
+                inferred_field::<DECIMAL, SNOWFLAKE>(field_name, inferred)
+            })
             .collect();
 
         Ok((Schema::new(fields), records_count))
     }
 
-    fn infer_schema_with_quoted_empty<R: Read, const DECIMAL: bool>(
+    fn infer_schema_with_quoted_empty<R: Read, const DECIMAL: bool, const SNOWFLAKE: bool>(
         &self,
         reader: R,
         max_records: Option<usize>,
@@ -613,7 +662,10 @@ impl Format {
         let mut column_types: Vec<InferredDataType> = vec![Default::default(); headers.len()];
         let max_records = max_records.unwrap_or(usize::MAX);
         if max_records == 0 {
-            return Ok((inferred_schema::<DECIMAL>(&headers, &column_types), 0));
+            return Ok((
+                inferred_schema::<DECIMAL, SNOWFLAKE>(&headers, &column_types),
+                0,
+            ));
         }
 
         let schema = Arc::new(Schema::new(
@@ -648,8 +700,10 @@ impl Format {
                         ArrowError::CsvError("CSV inference expected a string column".to_owned())
                     })?;
                 for value in strings.iter().flatten() {
-                    if DECIMAL {
-                        column_type.update_decimal(value);
+                    if SNOWFLAKE {
+                        column_type.update_snowflake(value);
+                    } else if DECIMAL {
+                        column_type.update_decimal::<false>(value);
                     } else {
                         column_type.update(value);
                     }
@@ -657,7 +711,7 @@ impl Format {
             }
         }
         Ok((
-            inferred_schema::<DECIMAL>(&headers, &column_types),
+            inferred_schema::<DECIMAL, SNOWFLAKE>(&headers, &column_types),
             records_count,
         ))
     }
@@ -703,7 +757,7 @@ impl Format {
     }
 }
 
-fn inferred_schema<const DECIMAL: bool>(
+fn inferred_schema<const DECIMAL: bool, const SNOWFLAKE: bool>(
     headers: &[String],
     column_types: &[InferredDataType],
 ) -> Schema {
@@ -711,13 +765,18 @@ fn inferred_schema<const DECIMAL: bool>(
         column_types
             .iter()
             .zip(headers)
-            .map(|(inferred, name)| inferred_field::<DECIMAL>(name, inferred))
+            .map(|(inferred, name)| inferred_field::<DECIMAL, SNOWFLAKE>(name, inferred))
             .collect::<Fields>(),
     )
 }
 
-fn inferred_field<const DECIMAL: bool>(name: &str, inferred: &InferredDataType) -> Field {
-    let data_type = if DECIMAL {
+fn inferred_field<const DECIMAL: bool, const SNOWFLAKE: bool>(
+    name: &str,
+    inferred: &InferredDataType,
+) -> Field {
+    let data_type = if SNOWFLAKE {
+        inferred.get_snowflake()
+    } else if DECIMAL {
         inferred.get_decimal()
     } else {
         inferred.get()
@@ -1748,6 +1807,62 @@ mod tests {
         );
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
         assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(1, 0));
+    }
+
+    #[test]
+    fn test_snowflake_ordered_inference_matches_numeric_and_temporal_probes() {
+        let tiny = format!("0.{}1", "0".repeat(37));
+        let large = "123456789012345678901234567890123456789";
+        let cases = [
+            ("1\n1e2\n".to_owned(), DataType::Utf8),
+            ("1e2\n1\n".to_owned(), DataType::Float64),
+            (format!("1\n{large}\n"), DataType::Utf8),
+            (format!("{large}\n1\n"), DataType::Float64),
+            (format!("0\n{tiny}\n"), DataType::Utf8),
+            (format!("{tiny}\n0\n"), DataType::Float64),
+            (
+                "2024-01-02\n2024-01-02 01:02:03\n".to_owned(),
+                DataType::Date32,
+            ),
+            (
+                "2024-01-02 01:02:03\n2024-01-02\n".to_owned(),
+                DataType::Utf8,
+            ),
+            (
+                format!("0\n0.{}1\n", "0".repeat(36)),
+                DataType::Decimal128(38, 37),
+            ),
+            ("1.20\n123.400\n".to_owned(), DataType::Decimal128(6, 3)),
+        ];
+        for (values, expected) in cases {
+            let csv = format!("VALUE\n{values}");
+            let (schema, records) = Format::default()
+                .with_header(true)
+                .infer_schema_with_snowflake_types(Cursor::new(csv), None)
+                .unwrap();
+            assert_eq!(records, 2);
+            assert_eq!(schema.field(0).data_type(), &expected, "{values}");
+        }
+
+        let (limited, records) = Format::default()
+            .with_header(true)
+            .infer_schema_with_snowflake_types(Cursor::new("VALUE\n1\n1e2\n"), Some(1))
+            .unwrap();
+        assert_eq!(records, 1);
+        assert_eq!(limited.field(0).data_type(), &DataType::Decimal128(1, 0));
+    }
+
+    #[test]
+    fn test_snowflake_ordered_inference_preserves_quoted_empty() {
+        let tiny = format!("0.{}1", "0".repeat(37));
+        let csv = format!("VALUE\n0\n\"\"\n{tiny}\n");
+        let (schema, records) = Format::default()
+            .with_header(true)
+            .with_preserve_quoted_empty(true)
+            .infer_schema_with_snowflake_types(Cursor::new(csv), None)
+            .unwrap();
+        assert_eq!(records, 3);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
     }
 
     #[test]
@@ -3691,7 +3806,7 @@ mod tests {
         for (values, expected) in cases {
             let mut t = InferredDataType::default();
             for v in *values {
-                t.update(v)
+                t.update(v);
             }
             assert_eq!(&t.get(), expected, "{values:?}")
         }
