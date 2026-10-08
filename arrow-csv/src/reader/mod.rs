@@ -283,6 +283,8 @@ struct InferredDataType {
     /// 7 - Timestamp(Nanosecond)
     /// 8 - Utf8
     packed: u16,
+    max_integral_digits: u8,
+    max_scale: u8,
 }
 
 impl InferredDataType {
@@ -306,6 +308,40 @@ impl InferredDataType {
         }
     }
 
+    fn get_decimal(&self) -> DataType {
+        if self.packed == (1 << 1) {
+            let precision = u16::from(self.max_integral_digits) + u16::from(self.max_scale);
+            let precision = if self.max_integral_digits == 0 && self.max_scale > 0 && precision < 38
+            {
+                precision + 1
+            } else {
+                precision.max(1)
+            };
+            if precision <= 38 {
+                return DataType::Decimal128(precision as u8, self.max_scale as i8);
+            }
+            return DataType::Float64;
+        }
+        self.get()
+    }
+
+    fn update_decimal(&mut self, string: &str) {
+        if let Some((integral_digits, scale)) = decimal_shape(string) {
+            let precision = integral_digits + scale;
+            if precision > 38 {
+                self.packed |= 1 << 2; // Float64 for numbers outside Decimal128's range.
+            } else {
+                self.packed |= 1 << 1;
+                self.max_integral_digits = self.max_integral_digits.max(integral_digits as u8);
+                self.max_scale = self.max_scale.max(scale as u8);
+            }
+        } else if string.is_ascii() {
+            self.update(string);
+        } else {
+            self.packed |= 1 << 8; // Unicode digits are not parsed by Decimal128.
+        }
+    }
+
     /// Updates the [`InferredDataType`] with the given string
     fn update(&mut self, string: &str) {
         self.packed |= if string.starts_with('"') {
@@ -323,6 +359,33 @@ impl InferredDataType {
             1 << 8 // Utf8
         }
     }
+}
+
+fn decimal_shape(value: &str) -> Option<(usize, usize)> {
+    let bytes = value.as_bytes();
+    let bytes = if matches!(bytes.first(), Some(b'+' | b'-')) {
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    let dot = bytes.iter().position(|&byte| byte == b'.');
+    let (whole, fraction) = if let Some(dot) = dot {
+        (&bytes[..dot], &bytes[dot + 1..])
+    } else {
+        (bytes, &[][..])
+    };
+    if whole.is_empty() && fraction.is_empty()
+        || !whole.iter().chain(fraction).all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let integral_digits = whole.iter().skip_while(|&&byte| byte == b'0').count();
+    let scale = if fraction.iter().any(|&byte| byte != b'0') {
+        fraction.len()
+    } else {
+        0
+    };
+    Some((integral_digits, scale))
 }
 
 /// The format specification for the CSV file
@@ -435,8 +498,27 @@ impl Format {
         reader: R,
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
+        self.infer_schema_impl::<R, false>(reader, max_records)
+    }
+
+    /// Infer fixed-point CSV values as `Decimal128(precision, scale)` instead
+    /// of widening them to `Float64` or treating large integers as text.
+    /// The default [`Self::infer_schema`] behavior is unchanged.
+    pub fn infer_schema_with_decimal<R: Read>(
+        &self,
+        reader: R,
+        max_records: Option<usize>,
+    ) -> Result<(Schema, usize), ArrowError> {
+        self.infer_schema_impl::<R, true>(reader, max_records)
+    }
+
+    fn infer_schema_impl<R: Read, const DECIMAL: bool>(
+        &self,
+        reader: R,
+        max_records: Option<usize>,
+    ) -> Result<(Schema, usize), ArrowError> {
         if self.preserve_quoted_empty && self.null_regex.is_null("") {
-            return self.infer_schema_with_quoted_empty(reader, max_records);
+            return self.infer_schema_with_quoted_empty::<R, DECIMAL>(reader, max_records);
         }
         let mut csv_reader = self.build_reader(reader);
 
@@ -471,7 +553,11 @@ impl Format {
             for (i, column_type) in column_types.iter_mut().enumerate().take(header_length) {
                 if let Some(string) = record.get(i) {
                     if !self.null_regex.is_null(string) {
-                        column_type.update(string)
+                        if DECIMAL {
+                            column_type.update_decimal(string);
+                        } else {
+                            column_type.update(string);
+                        }
                     }
                 }
             }
@@ -481,13 +567,20 @@ impl Format {
         let fields: Fields = column_types
             .iter()
             .zip(&headers)
-            .map(|(inferred, field_name)| Field::new(field_name, inferred.get(), true))
+            .map(|(inferred, field_name)| {
+                let data_type = if DECIMAL {
+                    inferred.get_decimal()
+                } else {
+                    inferred.get()
+                };
+                Field::new(field_name, data_type, true)
+            })
             .collect();
 
         Ok((Schema::new(fields), records_count))
     }
 
-    fn infer_schema_with_quoted_empty<R: Read>(
+    fn infer_schema_with_quoted_empty<R: Read, const DECIMAL: bool>(
         &self,
         reader: R,
         max_records: Option<usize>,
@@ -513,7 +606,7 @@ impl Format {
         let mut column_types: Vec<InferredDataType> = vec![Default::default(); headers.len()];
         let max_records = max_records.unwrap_or(usize::MAX);
         if max_records == 0 {
-            return Ok((inferred_schema(&headers, &column_types), 0));
+            return Ok((inferred_schema::<DECIMAL>(&headers, &column_types), 0));
         }
 
         let schema = Arc::new(Schema::new(
@@ -548,11 +641,18 @@ impl Format {
                         ArrowError::CsvError("CSV inference expected a string column".to_owned())
                     })?;
                 for value in strings.iter().flatten() {
-                    column_type.update(value);
+                    if DECIMAL {
+                        column_type.update_decimal(value);
+                    } else {
+                        column_type.update(value);
+                    }
                 }
             }
         }
-        Ok((inferred_schema(&headers, &column_types), records_count))
+        Ok((
+            inferred_schema::<DECIMAL>(&headers, &column_types),
+            records_count,
+        ))
     }
 
     /// Build a [`csv::Reader`] for this [`Format`]
@@ -596,12 +696,22 @@ impl Format {
     }
 }
 
-fn inferred_schema(headers: &[String], column_types: &[InferredDataType]) -> Schema {
+fn inferred_schema<const DECIMAL: bool>(
+    headers: &[String],
+    column_types: &[InferredDataType],
+) -> Schema {
     Schema::new(
         column_types
             .iter()
             .zip(headers)
-            .map(|(inferred, name)| Field::new(name, inferred.get(), true))
+            .map(|(inferred, name)| {
+                let data_type = if DECIMAL {
+                    inferred.get_decimal()
+                } else {
+                    inferred.get()
+                };
+                Field::new(name, data_type, true)
+            })
             .collect::<Fields>(),
     )
 }
@@ -1534,6 +1644,113 @@ impl ReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decimal_inference_is_opt_in_and_bounded() {
+        let csv = concat!(
+            "SMALL,ZEROS,SIGNED,DECIMAL,MIXED,REAL,BIG,MAX38,OVER38,ZERO_SCALE,LEADING,QUOTED\n",
+            "1,00123,-12,1.20,1.2,1e2,12345678901234567890,",
+            "12345678901234567890123456789012345678,",
+            "123456789012345678901234567890123456789,0.000,00012.0300,\"12\"\n",
+            "12,00042,+5,123.400,123,2.3,1,1,1,0,1.0,\"3\"\n"
+        );
+        let format = Format::default().with_header(true);
+        let (schema, records) = format
+            .infer_schema_with_decimal(Cursor::new(csv), None)
+            .unwrap();
+        assert_eq!(records, 2);
+        let types = schema
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                DataType::Decimal128(2, 0),
+                DataType::Decimal128(3, 0),
+                DataType::Decimal128(2, 0),
+                DataType::Decimal128(6, 3),
+                DataType::Decimal128(4, 1),
+                DataType::Float64,
+                DataType::Decimal128(20, 0),
+                DataType::Decimal128(38, 0),
+                DataType::Float64,
+                DataType::Decimal128(1, 0),
+                DataType::Decimal128(6, 4),
+                DataType::Decimal128(2, 0),
+            ]
+        );
+        let (default_schema, _) = format.infer_schema(Cursor::new(csv), None).unwrap();
+        assert_eq!(default_schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(default_schema.field(3).data_type(), &DataType::Float64);
+        assert_eq!(default_schema.field(6).data_type(), &DataType::Utf8);
+
+        let (limited, records) = format
+            .infer_schema_with_decimal(Cursor::new("A\n1\n123\n"), Some(1))
+            .unwrap();
+        assert_eq!(records, 1);
+        assert_eq!(limited.field(0).data_type(), &DataType::Decimal128(1, 0));
+    }
+
+    #[test]
+    fn test_decimal_inference_preserves_quoted_empty_provenance() {
+        let format = Format::default()
+            .with_header(true)
+            .with_preserve_quoted_empty(true);
+        let csv = "ID,VALUE\n1,42\n2,\"\"\n";
+        let (schema, records) = format
+            .infer_schema_with_decimal(Cursor::new(csv), None)
+            .unwrap();
+        assert_eq!(records, 2);
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(1, 0));
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_decimal_inference_scale_38_and_unicode_digits() {
+        let csv = format!("EXACT,UNICODE,ZERO\n0.{}1,١,0\n", "0".repeat(37));
+        let (schema, records) = Format::default()
+            .with_header(true)
+            .infer_schema_with_decimal(Cursor::new(csv), None)
+            .unwrap();
+        assert_eq!(records, 1);
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(38, 38));
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(1, 0));
+    }
+
+    #[test]
+    fn test_decimal_inference_schema_reads_exact_values() {
+        let tiny = format!("0.{}1", "0".repeat(37));
+        let csv = format!("EXACT,MIXED\n{tiny},1.20\n{tiny},123.400\n");
+        let format = Format::default().with_header(true);
+        let (schema, _) = format
+            .infer_schema_with_decimal(Cursor::new(&csv), None)
+            .unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(38, 38));
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal128(6, 3));
+
+        let mut reader = ReaderBuilder::new(Arc::new(schema))
+            .with_header(true)
+            .build(Cursor::new(csv))
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let exact = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        let mixed = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(exact.value_as_string(0), tiny);
+        assert_eq!(exact.value_as_string(1), tiny);
+        assert_eq!(mixed.value_as_string(0), "1.200");
+        assert_eq!(mixed.value_as_string(1), "123.400");
+    }
 
     #[test]
     fn test_large_exact_null_value_set() {
