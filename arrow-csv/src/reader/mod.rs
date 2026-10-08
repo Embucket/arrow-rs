@@ -295,6 +295,12 @@ struct InferredDataType {
 /// not maintain this invariant across merged fields.
 pub const CSV_DECIMAL_ZERO_ONLY_METADATA_KEY: &str = "ARROW:csv_decimal_zero_only";
 
+/// Field metadata set by decimal CSV inference when no observed numeric value
+/// has a nonzero integral digit. This includes zero-only columns and nonzero
+/// fractions such as `0.1`. Like the zero-only key, it is chunk-local metadata
+/// and must be inspected before generic field merging.
+pub const CSV_DECIMAL_ZERO_INTEGRAL_METADATA_KEY: &str = "ARROW:csv_decimal_zero_integral";
+
 impl InferredDataType {
     /// Returns the inferred data type
     fn get(&self) -> DataType {
@@ -717,15 +723,18 @@ fn inferred_field<const DECIMAL: bool>(name: &str, inferred: &InferredDataType) 
         inferred.get()
     };
     let field = Field::new(name, data_type, true);
-    if DECIMAL
-        && inferred.packed == (1 << 1)
-        && inferred.max_integral_digits == 0
-        && inferred.max_scale == 0
-    {
-        field.with_metadata(HashMap::from([(
-            CSV_DECIMAL_ZERO_ONLY_METADATA_KEY.to_owned(),
+    if DECIMAL && inferred.packed == (1 << 1) && inferred.max_integral_digits == 0 {
+        let mut metadata = HashMap::from([(
+            CSV_DECIMAL_ZERO_INTEGRAL_METADATA_KEY.to_owned(),
             "true".to_owned(),
-        )]))
+        )]);
+        if inferred.max_scale == 0 {
+            metadata.insert(
+                CSV_DECIMAL_ZERO_ONLY_METADATA_KEY.to_owned(),
+                "true".to_owned(),
+            );
+        }
+        field.with_metadata(metadata)
     } else {
         field
     }
@@ -1731,6 +1740,12 @@ mod tests {
             .unwrap();
         assert_eq!(records, 1);
         assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(38, 38));
+        assert!(
+            schema
+                .field(0)
+                .metadata()
+                .contains_key(CSV_DECIMAL_ZERO_INTEGRAL_METADATA_KEY)
+        );
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
         assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(1, 0));
     }
@@ -1768,7 +1783,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decimal_inference_marks_zero_only_chunks() {
+    fn test_decimal_inference_marks_zero_integral_chunks() {
         let format = Format::default().with_header(true);
         let (zeros, _) = format
             .infer_schema_with_decimal(Cursor::new("VALUE\n0\n-0.000\n"), None)
@@ -1778,8 +1793,30 @@ mod tests {
             zeros
                 .field(0)
                 .metadata()
-                .get(CSV_DECIMAL_ZERO_ONLY_METADATA_KEY),
+                .get(CSV_DECIMAL_ZERO_INTEGRAL_METADATA_KEY),
             Some(&"true".to_owned())
+        );
+        assert!(
+            zeros
+                .field(0)
+                .metadata()
+                .contains_key(CSV_DECIMAL_ZERO_ONLY_METADATA_KEY)
+        );
+        let (fraction, _) = format
+            .infer_schema_with_decimal(Cursor::new("VALUE\n0.1\n0.001\n"), None)
+            .unwrap();
+        assert_eq!(fraction.field(0).data_type(), &DataType::Decimal128(4, 3));
+        assert!(
+            fraction
+                .field(0)
+                .metadata()
+                .contains_key(CSV_DECIMAL_ZERO_INTEGRAL_METADATA_KEY)
+        );
+        assert!(
+            !fraction
+                .field(0)
+                .metadata()
+                .contains_key(CSV_DECIMAL_ZERO_ONLY_METADATA_KEY)
         );
         let (nonzero, _) = format
             .infer_schema_with_decimal(Cursor::new("VALUE\n1\n"), None)
@@ -1788,7 +1825,7 @@ mod tests {
             !nonzero
                 .field(0)
                 .metadata()
-                .contains_key(CSV_DECIMAL_ZERO_ONLY_METADATA_KEY)
+                .contains_key(CSV_DECIMAL_ZERO_INTEGRAL_METADATA_KEY)
         );
         let (legacy, _) = format
             .infer_schema(Cursor::new("VALUE\n0\n"), None)
