@@ -287,7 +287,28 @@ struct InferredDataType {
     max_integral_digits: u8,
     max_scale: u8,
     first_snowflake_type: u16,
-    snowflake_type_conflict: bool,
+}
+
+/// Ordered, per-column CSV inference state. Merge states in file order to
+/// preserve Snowflake's asymmetric numeric and temporal type transitions.
+#[derive(Clone, Copy, Default)]
+pub struct SnowflakeCsvTypeState(InferredDataType);
+
+impl SnowflakeCsvTypeState {
+    /// Merge a later chunk's inferred state into this state.
+    pub fn merge(&mut self, later: &Self) {
+        if self.0.first_snowflake_type == 0 {
+            self.0.first_snowflake_type = later.0.first_snowflake_type;
+        }
+        self.0.packed |= later.0.packed;
+        self.0.max_integral_digits = self.0.max_integral_digits.max(later.0.max_integral_digits);
+        self.0.max_scale = self.0.max_scale.max(later.0.max_scale);
+    }
+
+    /// Return the type inferred from all states merged so far.
+    pub fn data_type(&self) -> DataType {
+        self.0.get_snowflake()
+    }
 }
 
 /// Field metadata set by decimal CSV inference when all observed numeric
@@ -342,25 +363,28 @@ impl InferredDataType {
     }
 
     fn get_snowflake(&self) -> DataType {
-        if self.snowflake_type_conflict {
+        const TIMESTAMP_TYPES: u16 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+        if (self.first_snowflake_type == (1 << 1) && self.packed & (1 << 2) != 0)
+            || (self.first_snowflake_type & TIMESTAMP_TYPES != 0 && self.packed & (1 << 3) != 0)
+        {
             return DataType::Utf8;
         }
         const TEMPORAL_TYPES: u16 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
         if self.first_snowflake_type == (1 << 3) && self.packed & !TEMPORAL_TYPES == 0 {
             return DataType::Date32;
         }
+        if self.packed == (1 << 1) {
+            let integral_digits = self.max_integral_digits.max(1);
+            let scale = self.max_scale.min(38 - integral_digits);
+            return DataType::Decimal128(integral_digits + scale, scale as i8);
+        }
         self.get_decimal()
     }
 
     fn update_snowflake(&mut self, string: &str) {
         let value_type = self.update_decimal::<true>(string);
-        const TIMESTAMP_TYPES: u16 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
         if self.first_snowflake_type == 0 {
             self.first_snowflake_type = value_type;
-        } else if (self.first_snowflake_type == (1 << 1) && value_type == (1 << 2))
-            || (self.first_snowflake_type & TIMESTAMP_TYPES != 0 && value_type == (1 << 3))
-        {
-            self.snowflake_type_conflict = true;
         }
     }
 
@@ -546,7 +570,9 @@ impl Format {
         reader: R,
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
-        self.infer_schema_impl::<R, false, false>(reader, max_records)
+        let (schema, _, records) =
+            self.infer_schema_impl::<R, false, false>(reader, max_records)?;
+        Ok((schema, records))
     }
 
     /// Infer fixed-point CSV values as `Decimal128(precision, scale)` instead
@@ -557,16 +583,18 @@ impl Format {
         reader: R,
         max_records: Option<usize>,
     ) -> Result<(Schema, usize), ArrowError> {
-        self.infer_schema_impl::<R, true, false>(reader, max_records)
+        let (schema, _, records) = self.infer_schema_impl::<R, true, false>(reader, max_records)?;
+        Ok((schema, records))
     }
 
     /// Infer exact decimals with Snowflake's order-sensitive CSV type promotion.
-    /// This is separate from ordinary and order-independent decimal inference.
+    /// The returned per-column states can be merged in order when a file is
+    /// scanned in multiple chunks. Ordinary inference methods are unchanged.
     pub fn infer_schema_with_snowflake_types<R: Read>(
         &self,
         reader: R,
         max_records: Option<usize>,
-    ) -> Result<(Schema, usize), ArrowError> {
+    ) -> Result<(Schema, Vec<SnowflakeCsvTypeState>, usize), ArrowError> {
         self.infer_schema_impl::<R, true, true>(reader, max_records)
     }
 
@@ -574,7 +602,7 @@ impl Format {
         &self,
         reader: R,
         max_records: Option<usize>,
-    ) -> Result<(Schema, usize), ArrowError> {
+    ) -> Result<(Schema, Vec<SnowflakeCsvTypeState>, usize), ArrowError> {
         if self.preserve_quoted_empty && self.null_regex.is_null("") {
             return self
                 .infer_schema_with_quoted_empty::<R, DECIMAL, SNOWFLAKE>(reader, max_records);
@@ -633,14 +661,18 @@ impl Format {
             })
             .collect();
 
-        Ok((Schema::new(fields), records_count))
+        Ok((
+            Schema::new(fields),
+            snowflake_states::<SNOWFLAKE>(&column_types),
+            records_count,
+        ))
     }
 
     fn infer_schema_with_quoted_empty<R: Read, const DECIMAL: bool, const SNOWFLAKE: bool>(
         &self,
         reader: R,
         max_records: Option<usize>,
-    ) -> Result<(Schema, usize), ArrowError> {
+    ) -> Result<(Schema, Vec<SnowflakeCsvTypeState>, usize), ArrowError> {
         let recording = RecordingReader {
             inner: reader,
             prefix: Vec::new(),
@@ -664,6 +696,7 @@ impl Format {
         if max_records == 0 {
             return Ok((
                 inferred_schema::<DECIMAL, SNOWFLAKE>(&headers, &column_types),
+                snowflake_states::<SNOWFLAKE>(&column_types),
                 0,
             ));
         }
@@ -712,6 +745,7 @@ impl Format {
         }
         Ok((
             inferred_schema::<DECIMAL, SNOWFLAKE>(&headers, &column_types),
+            snowflake_states::<SNOWFLAKE>(&column_types),
             records_count,
         ))
     }
@@ -754,6 +788,20 @@ impl Format {
             builder.terminator(csv_core::Terminator::Any(t));
         }
         builder.build()
+    }
+}
+
+fn snowflake_states<const SNOWFLAKE: bool>(
+    column_types: &[InferredDataType],
+) -> Vec<SnowflakeCsvTypeState> {
+    if SNOWFLAKE {
+        column_types
+            .iter()
+            .copied()
+            .map(SnowflakeCsvTypeState)
+            .collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -1836,7 +1884,7 @@ mod tests {
         ];
         for (values, expected) in cases {
             let csv = format!("VALUE\n{values}");
-            let (schema, records) = Format::default()
+            let (schema, _, records) = Format::default()
                 .with_header(true)
                 .infer_schema_with_snowflake_types(Cursor::new(csv), None)
                 .unwrap();
@@ -1844,7 +1892,7 @@ mod tests {
             assert_eq!(schema.field(0).data_type(), &expected, "{values}");
         }
 
-        let (limited, records) = Format::default()
+        let (limited, _, records) = Format::default()
             .with_header(true)
             .infer_schema_with_snowflake_types(Cursor::new("VALUE\n1\n1e2\n"), Some(1))
             .unwrap();
@@ -1856,13 +1904,65 @@ mod tests {
     fn test_snowflake_ordered_inference_preserves_quoted_empty() {
         let tiny = format!("0.{}1", "0".repeat(37));
         let csv = format!("VALUE\n0\n\"\"\n{tiny}\n");
-        let (schema, records) = Format::default()
+        let (schema, _, records) = Format::default()
             .with_header(true)
             .with_preserve_quoted_empty(true)
             .infer_schema_with_snowflake_types(Cursor::new(csv), None)
             .unwrap();
         assert_eq!(records, 3);
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_snowflake_states_merge_independent_of_chunk_boundaries() {
+        let cases = [
+            ("2024-01-02", "2024-01-02 01:02:03\n2024-01-02"),
+            ("2024-01-02 01:02:03", "2024-01-02\n2024-01-02 01:02:03"),
+            ("1e2", "1\n1e2"),
+            ("1", "1e2\n1"),
+            ("1234567890123456789012345678901234567", "0.01"),
+            ("0.01", "1234567890123456789012345678901234567"),
+            ("12345678901234567890123456789012345678", "0.1"),
+            ("0.1", "12345678901234567890123456789012345678"),
+        ];
+        let format = Format::default().with_header(true);
+        for (first, later) in cases {
+            let (direct, _, _) = format
+                .infer_schema_with_snowflake_types(
+                    Cursor::new(format!("VALUE\n{first}\n{later}\n")),
+                    None,
+                )
+                .unwrap();
+            let (_, mut first_state, _) = format
+                .infer_schema_with_snowflake_types(Cursor::new(format!("VALUE\n{first}\n")), None)
+                .unwrap();
+            let (_, later_state, _) = format
+                .infer_schema_with_snowflake_types(Cursor::new(format!("VALUE\n{later}\n")), None)
+                .unwrap();
+            first_state[0].merge(&later_state[0]);
+            assert_eq!(first_state[0].data_type(), *direct.field(0).data_type());
+        }
+
+        for (first, later, expected) in [
+            (
+                "1234567890123456789012345678901234567",
+                "0.01",
+                DataType::Decimal128(38, 1),
+            ),
+            (
+                "12345678901234567890123456789012345678",
+                "0.1",
+                DataType::Decimal128(38, 0),
+            ),
+        ] {
+            let (schema, _, _) = format
+                .infer_schema_with_snowflake_types(
+                    Cursor::new(format!("VALUE\n{first}\n{later}\n")),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(schema.field(0).data_type(), &expected);
+        }
     }
 
     #[test]
