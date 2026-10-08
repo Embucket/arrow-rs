@@ -173,6 +173,7 @@ use arrow_schema::*;
 use chrono::{TimeZone, Utc};
 use csv::StringRecord;
 use regex::{Regex, RegexSet};
+use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader as StdBufReader, Cursor, Read};
@@ -286,6 +287,13 @@ struct InferredDataType {
     max_integral_digits: u8,
     max_scale: u8,
 }
+
+/// Field metadata set by decimal CSV inference when all observed numeric
+/// values in a column are zero. Consumers merging independently inferred
+/// chunks can ignore such values when choosing integral precision. This is
+/// chunk-local metadata: generic `Field::try_merge` unions metadata and does
+/// not maintain this invariant across merged fields.
+pub const CSV_DECIMAL_ZERO_ONLY_METADATA_KEY: &str = "ARROW:csv_decimal_zero_only";
 
 impl InferredDataType {
     /// Returns the inferred data type
@@ -567,14 +575,7 @@ impl Format {
         let fields: Fields = column_types
             .iter()
             .zip(&headers)
-            .map(|(inferred, field_name)| {
-                let data_type = if DECIMAL {
-                    inferred.get_decimal()
-                } else {
-                    inferred.get()
-                };
-                Field::new(field_name, data_type, true)
-            })
+            .map(|(inferred, field_name)| inferred_field::<DECIMAL>(field_name, inferred))
             .collect();
 
         Ok((Schema::new(fields), records_count))
@@ -704,16 +705,30 @@ fn inferred_schema<const DECIMAL: bool>(
         column_types
             .iter()
             .zip(headers)
-            .map(|(inferred, name)| {
-                let data_type = if DECIMAL {
-                    inferred.get_decimal()
-                } else {
-                    inferred.get()
-                };
-                Field::new(name, data_type, true)
-            })
+            .map(|(inferred, name)| inferred_field::<DECIMAL>(name, inferred))
             .collect::<Fields>(),
     )
+}
+
+fn inferred_field<const DECIMAL: bool>(name: &str, inferred: &InferredDataType) -> Field {
+    let data_type = if DECIMAL {
+        inferred.get_decimal()
+    } else {
+        inferred.get()
+    };
+    let field = Field::new(name, data_type, true);
+    if DECIMAL
+        && inferred.packed == (1 << 1)
+        && inferred.max_integral_digits == 0
+        && inferred.max_scale == 0
+    {
+        field.with_metadata(HashMap::from([(
+            CSV_DECIMAL_ZERO_ONLY_METADATA_KEY.to_owned(),
+            "true".to_owned(),
+        )]))
+    } else {
+        field
+    }
 }
 
 struct RecordingReader<R> {
@@ -1750,6 +1765,35 @@ mod tests {
         assert_eq!(exact.value_as_string(1), tiny);
         assert_eq!(mixed.value_as_string(0), "1.200");
         assert_eq!(mixed.value_as_string(1), "123.400");
+    }
+
+    #[test]
+    fn test_decimal_inference_marks_zero_only_chunks() {
+        let format = Format::default().with_header(true);
+        let (zeros, _) = format
+            .infer_schema_with_decimal(Cursor::new("VALUE\n0\n-0.000\n"), None)
+            .unwrap();
+        assert_eq!(zeros.field(0).data_type(), &DataType::Decimal128(1, 0));
+        assert_eq!(
+            zeros
+                .field(0)
+                .metadata()
+                .get(CSV_DECIMAL_ZERO_ONLY_METADATA_KEY),
+            Some(&"true".to_owned())
+        );
+        let (nonzero, _) = format
+            .infer_schema_with_decimal(Cursor::new("VALUE\n1\n"), None)
+            .unwrap();
+        assert!(
+            !nonzero
+                .field(0)
+                .metadata()
+                .contains_key(CSV_DECIMAL_ZERO_ONLY_METADATA_KEY)
+        );
+        let (legacy, _) = format
+            .infer_schema(Cursor::new("VALUE\n0\n"), None)
+            .unwrap();
+        assert!(legacy.field(0).metadata().is_empty());
     }
 
     #[test]
