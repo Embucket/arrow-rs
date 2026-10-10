@@ -1564,6 +1564,20 @@ fn build_boolean_array<const NUMERIC: bool>(
                 match s {
                     "1" => Some(true),
                     "0" => Some(false),
+                    _ if s.eq_ignore_ascii_case("t")
+                        || s.eq_ignore_ascii_case("yes")
+                        || s.eq_ignore_ascii_case("y")
+                        || s.eq_ignore_ascii_case("on") =>
+                    {
+                        Some(true)
+                    }
+                    _ if s.eq_ignore_ascii_case("f")
+                        || s.eq_ignore_ascii_case("no")
+                        || s.eq_ignore_ascii_case("n")
+                        || s.eq_ignore_ascii_case("off") =>
+                    {
+                        Some(false)
+                    }
                     _ => None,
                 }
             } else {
@@ -1739,7 +1753,8 @@ impl ReaderBuilder {
         self
     }
 
-    /// Accept exact `0` and `1` values in Boolean columns in addition to `false` and `true`.
+    /// Accept `0`, `1`, `t`, `f`, `yes`, `no`, `y`, `n`, `on`, and `off` in Boolean columns.
+    /// The textual aliases are matched case-insensitively.
     /// Disabled by default to preserve the strict CSV reader behavior.
     pub fn with_numeric_boolean_values(mut self, allow: bool) -> Self {
         self.numeric_boolean_values = allow;
@@ -3180,7 +3195,7 @@ mod tests {
             DataType::Boolean,
             false,
         )]));
-        let values = "true\n1\n0\nFALSE\n";
+        let values = "true\n1\n0\nFALSE\nyes\nno\ny\nn\non\noff\nt\nf\nYeS\nOFF\n";
         let strict_error = ReaderBuilder::new(Arc::clone(&schema))
             .build(Cursor::new(values))
             .unwrap()
@@ -3191,6 +3206,17 @@ mod tests {
             strict_error
                 .to_string()
                 .contains("value '1' as type 'Boolean'")
+        );
+        let strict_alias_error = ReaderBuilder::new(Arc::clone(&schema))
+            .build(Cursor::new("yes\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            strict_alias_error
+                .to_string()
+                .contains("value 'yes' as type 'Boolean'")
         );
 
         let batch = ReaderBuilder::new(Arc::clone(&schema))
@@ -3203,7 +3229,10 @@ mod tests {
         let flags = batch.column(0).as_boolean();
         assert_eq!(
             flags.values().iter().collect::<Vec<_>>(),
-            [true, true, false, false]
+            [
+                true, true, false, false, true, false, true, false, true, false, true, false, true,
+                false,
+            ]
         );
 
         let invalid = ReaderBuilder::new(schema)
@@ -3214,6 +3243,38 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(invalid.to_string().contains("value '2' as type 'Boolean'"));
+    }
+
+    #[test]
+    #[ignore = "local CSV decode benchmark"]
+    fn bench_numeric_boolean_values() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            false,
+        )]));
+        let common = "true\nfalse\n".repeat(50_000);
+        let mixed = "true\n1\nyes\non\nfalse\n0\nno\noff\n".repeat(12_500);
+
+        for (name, values, extended) in [
+            ("strict/common", &common, false),
+            ("extended/common", &common, true),
+            ("extended/mixed", &mixed, true),
+        ] {
+            let mut samples = Vec::with_capacity(5);
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let reader = ReaderBuilder::new(Arc::clone(&schema))
+                    .with_numeric_boolean_values(extended)
+                    .build(Cursor::new(values.as_bytes()))
+                    .unwrap();
+                let rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+                assert_eq!(std::hint::black_box(rows), 100_000);
+                samples.push(start.elapsed());
+            }
+            samples.sort();
+            eprintln!("{name}: median {:?} for 100k rows", samples[2]);
+        }
     }
 
     #[test]
