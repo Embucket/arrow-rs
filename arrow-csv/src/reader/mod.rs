@@ -510,6 +510,7 @@ pub struct Format {
     null_regex: NullRegex,
     truncated_rows: bool,
     preserve_quoted_empty: bool,
+    replace_invalid_utf8: bool,
 }
 
 impl Format {
@@ -585,6 +586,13 @@ impl Format {
         self
     }
 
+    /// Replace malformed UTF-8 in decoded CSV fields during schema inference.
+    /// Disabled by default.
+    pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
+        self.replace_invalid_utf8 = replace;
+        self
+    }
+
     /// Whether to allow truncated rows when parsing.
     ///
     /// By default this is set to `false` and will error if the CSV rows have different lengths.
@@ -648,7 +656,21 @@ impl Format {
 
         // get or create header names
         // when has_header is false, creates default column names with column_ prefix
-        let headers: Vec<String> = if self.header {
+        let headers: Vec<String> = if self.replace_invalid_utf8 {
+            csv_reader
+                .byte_headers()
+                .map_err(map_csv_error)?
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| {
+                    if self.header {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    } else {
+                        format!("column_{}", index + 1)
+                    }
+                })
+                .collect()
+        } else if self.header {
             let headers = &csv_reader.headers().map_err(map_csv_error)?.clone();
             headers.iter().map(|s| s.to_string()).collect()
         } else {
@@ -664,25 +686,48 @@ impl Format {
 
         let mut records_count = 0;
 
-        let mut record = StringRecord::new();
         let max_records = max_records.unwrap_or(usize::MAX);
-        while records_count < max_records {
-            if !csv_reader.read_record(&mut record).map_err(map_csv_error)? {
-                break;
+        if self.replace_invalid_utf8 {
+            let mut record = csv::ByteRecord::new();
+            while records_count < max_records
+                && csv_reader
+                    .read_byte_record(&mut record)
+                    .map_err(map_csv_error)?
+            {
+                records_count += 1;
+                for (i, column_type) in column_types.iter_mut().enumerate().take(header_length) {
+                    if let Some(bytes) = record.get(i) {
+                        let string = String::from_utf8_lossy(bytes);
+                        if !self.null_regex.is_null(&string) {
+                            if SNOWFLAKE {
+                                column_type.update_snowflake(&string);
+                            } else if DECIMAL {
+                                column_type.update_decimal::<false>(&string);
+                            } else {
+                                column_type.update(&string);
+                            }
+                        }
+                    }
+                }
             }
-            records_count += 1;
-
-            // Note since we may be looking at a sample of the data, we make the safe assumption that
-            // they could be nullable
-            for (i, column_type) in column_types.iter_mut().enumerate().take(header_length) {
-                if let Some(string) = record.get(i) {
-                    if !self.null_regex.is_null(string) {
-                        if SNOWFLAKE {
-                            column_type.update_snowflake(string);
-                        } else if DECIMAL {
-                            column_type.update_decimal::<false>(string);
-                        } else {
-                            column_type.update(string);
+        } else {
+            let mut record = StringRecord::new();
+            while records_count < max_records {
+                if !csv_reader.read_record(&mut record).map_err(map_csv_error)? {
+                    break;
+                }
+                records_count += 1;
+                // Inferred columns remain nullable because this is only a sample.
+                for (i, column_type) in column_types.iter_mut().enumerate().take(header_length) {
+                    if let Some(string) = record.get(i) {
+                        if !self.null_regex.is_null(string) {
+                            if SNOWFLAKE {
+                                column_type.update_snowflake(string);
+                            } else if DECIMAL {
+                                column_type.update_decimal::<false>(string);
+                            } else {
+                                column_type.update(string);
+                            }
                         }
                     }
                 }
@@ -715,7 +760,21 @@ impl Format {
             prefix: Vec::new(),
         };
         let mut header_reader = self.build_reader(recording);
-        let headers: Vec<String> = if self.header {
+        let headers: Vec<String> = if self.replace_invalid_utf8 {
+            header_reader
+                .byte_headers()
+                .map_err(map_csv_error)?
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| {
+                    if self.header {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    } else {
+                        format!("column_{}", index + 1)
+                    }
+                })
+                .collect()
+        } else if self.header {
             header_reader
                 .headers()
                 .map_err(map_csv_error)?
@@ -1643,7 +1702,6 @@ pub struct ReaderBuilder {
     projection: Option<Vec<usize>>,
     /// Optional handler for records whose field count differs from the schema.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
-    replace_invalid_utf8: bool,
     numeric_boolean_values: bool,
 }
 
@@ -1678,7 +1736,6 @@ impl ReaderBuilder {
             bounds: None,
             projection: None,
             record_error_handler: None,
-            replace_invalid_utf8: false,
             numeric_boolean_values: false,
         }
     }
@@ -1799,9 +1856,9 @@ impl ReaderBuilder {
     }
 
     /// Replace malformed UTF-8 in decoded CSV fields with U+FFFD.
-    /// Disabled by default; only malformed records allocate replacement data.
+    /// Disabled by default; malformed batches may allocate replacement data.
     pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
-        self.replace_invalid_utf8 = replace;
+        self.format.replace_invalid_utf8 = replace;
         self
     }
 
@@ -1830,7 +1887,7 @@ impl ReaderBuilder {
             self.format.truncated_rows,
         )
         .with_record_error_handler(self.record_error_handler)
-        .with_replace_invalid_utf8(self.replace_invalid_utf8)
+        .with_replace_invalid_utf8(self.format.replace_invalid_utf8)
         .with_ignored_prefix_options(self.format.comment, self.format.terminator)
         .with_utf8_preserving_syntax(
             self.format.delimiter.is_none_or(|byte| byte.is_ascii())
@@ -2011,6 +2068,56 @@ mod tests {
             assert_eq!(rows, 1_000_000);
             eprintln!(
                 "replace_invalid_utf8={replace} elapsed={:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn test_infer_schema_replaces_invalid_utf8_in_header_and_data() {
+        let csv = b"id,m\xffg\n1,\xfe\n";
+        assert!(
+            Format::default()
+                .with_header(true)
+                .infer_schema_with_snowflake_types(Cursor::new(csv), None)
+                .is_err()
+        );
+        for preserve_quoted_empty in [false, true] {
+            let (schema, _, records) = Format::default()
+                .with_header(true)
+                .with_preserve_quoted_empty(preserve_quoted_empty)
+                .with_replace_invalid_utf8(true)
+                .infer_schema_with_snowflake_types(Cursor::new(csv), None)
+                .unwrap();
+            assert_eq!(records, 1);
+            assert_eq!(schema.field(1).name(), "m�g");
+            assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        }
+    }
+
+    #[test]
+    #[ignore = "focused sparse-error CSV replacement benchmark"]
+    fn bench_sparse_invalid_utf8_replacement() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let mut csv = b"1,ok\n".repeat(1_000_000);
+        for invalid in [false, true] {
+            if invalid {
+                csv[500_000 * 5 + 2] = 0xff;
+            }
+            let start = std::time::Instant::now();
+            let rows = ReaderBuilder::new(Arc::clone(&schema))
+                .with_batch_size(4096)
+                .with_replace_invalid_utf8(true)
+                .build(Cursor::new(&csv))
+                .unwrap()
+                .map(|batch| batch.unwrap().num_rows())
+                .sum::<usize>();
+            assert_eq!(rows, 1_000_000);
+            eprintln!(
+                "sparse_invalid_utf8={invalid} elapsed={:?}",
                 start.elapsed()
             );
         }
