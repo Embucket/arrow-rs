@@ -22,18 +22,6 @@ use std::sync::Arc;
 use super::{CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler, NullRegex};
 
 #[derive(Debug)]
-struct RejectMalformedRecord;
-
-impl CsvRecordErrorHandler for RejectMalformedRecord {
-    fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
-        Err(ArrowError::CsvError(format!(
-            "incorrect number of fields for line {}, expected {} got {}",
-            error.line_number, error.expected_fields, error.actual_fields
-        )))
-    }
-}
-
-#[derive(Debug)]
 struct QuotedEmptyFields {
     delimiter: u8,
     quote: u8,
@@ -389,9 +377,6 @@ impl RecordDecoder {
         match self.record_error_handler.clone() {
             Some(handler) => {
                 self.decode_with_record_error_handler(input, to_read, handler.as_ref())
-            }
-            None if self.replace_invalid_utf8 => {
-                self.decode_with_record_error_handler(input, to_read, &RejectMalformedRecord)
             }
             None => self.decode_strict(input, to_read),
         }
@@ -825,6 +810,24 @@ impl RecordDecoder {
         Ok(())
     }
 
+    fn replace_invalid_utf8_batch(&mut self) -> Result<(), ArrowError> {
+        let original = self.data[..self.data_len].to_vec();
+        self.data.clear();
+        let mut field_start = 0;
+        for end in &mut self.offsets[1..self.offsets_len] {
+            let field_end = *end;
+            let field = original.get(field_start..field_end).ok_or_else(|| {
+                ArrowError::CsvError("CSV decoded field offset is invalid".to_owned())
+            })?;
+            self.data
+                .extend_from_slice(String::from_utf8_lossy(field).as_bytes());
+            *end = self.data.len();
+            field_start = field_end;
+        }
+        self.data_len = self.data.len();
+        Ok(())
+    }
+
     /// Returns the current number of buffered records
     pub fn len(&self) -> usize {
         self.num_rows
@@ -870,6 +873,19 @@ impl RecordDecoder {
                     Ok(())
                 })
             })?;
+
+        if self.replace_invalid_utf8 && self.record_error_handler.is_none() {
+            let decoded = std::str::from_utf8(&self.data[..self.data_len]);
+            let invalid_field = match decoded {
+                Ok(data) => self.offsets[1..self.offsets_len]
+                    .iter()
+                    .any(|end| !data.is_char_boundary(*end)),
+                Err(_) => true,
+            };
+            if invalid_field {
+                self.replace_invalid_utf8_batch()?;
+            }
+        }
 
         // Need to truncate data t1o the actual amount of data read
         let data = std::str::from_utf8(&self.data[..self.data_len]).map_err(|e| {
@@ -1519,8 +1535,9 @@ mod tests {
 
     #[test]
     fn test_replace_invalid_utf8_split_across_field_boundary() {
-        let mut decoder =
-            RecordDecoder::new(Reader::new(), 3, false).with_replace_invalid_utf8(true);
+        let mut decoder = RecordDecoder::new(Reader::new(), 3, false)
+            .with_utf8_preserving_syntax(true)
+            .with_replace_invalid_utf8(true);
         let csv = b"1,\xc3,\xa9\n";
         assert_eq!(decoder.decode(csv, 1).unwrap(), (1, csv.len()));
         let records = decoder.flush().unwrap();

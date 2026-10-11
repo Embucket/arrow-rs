@@ -1992,6 +1992,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "focused CSV UTF-8 replacement throughput benchmark"]
+    fn bench_valid_unicode_csv_with_optional_replacement() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = "1,é\n".repeat(1_000_000);
+        for replace in [false, true] {
+            let start = std::time::Instant::now();
+            let rows = ReaderBuilder::new(Arc::clone(&schema))
+                .with_batch_size(4096)
+                .with_replace_invalid_utf8(replace)
+                .build(Cursor::new(csv.as_bytes()))
+                .unwrap()
+                .map(|batch| batch.unwrap().num_rows())
+                .sum::<usize>();
+            assert_eq!(rows, 1_000_000);
+            eprintln!(
+                "replace_invalid_utf8={replace} elapsed={:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "local small-batch CSV recovery throughput benchmark"]
     fn bench_valid_unicode_csv_with_single_row_batches() {
         let schema = Arc::new(Schema::new(vec![
