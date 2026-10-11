@@ -209,10 +209,34 @@ pub struct CsvRecord<'a> {
     pub record: &'a [u8],
 }
 
+/// Source metadata for a CSV record containing invalid UTF-8 in a decoded field.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CsvInvalidUtf8Error<'a> {
+    /// One-based record number, including any header row.
+    pub line_number: usize,
+    /// Zero-based byte offset of the start of the record in the input stream.
+    pub byte_offset: usize,
+    /// Zero-based index of the decoded field containing invalid UTF-8.
+    pub field_index: usize,
+    /// Original record bytes, including its record terminator when present.
+    pub record: &'a [u8],
+}
+
 /// Receives malformed CSV records that should be skipped instead of aborting the scan.
 pub trait CsvRecordErrorHandler: Debug + Send + Sync {
     /// Handle one malformed record. Returning an error aborts the scan.
     fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError>;
+
+    /// Handle a record with invalid UTF-8. Returning `Ok(())` skips only this record.
+    ///
+    /// The default preserves the reader's previous error behavior for existing handlers.
+    fn handle_invalid_utf8(&self, error: &CsvInvalidUtf8Error<'_>) -> Result<(), ArrowError> {
+        Err(ArrowError::CsvError(format!(
+            "Encountered invalid UTF-8 data for line {} and field {}",
+            error.line_number,
+            error.field_index + 1
+        )))
+    }
 
     /// Observe one successfully decoded record.
     ///

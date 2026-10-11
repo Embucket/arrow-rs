@@ -19,7 +19,7 @@ use arrow_schema::ArrowError;
 use csv_core::{ReadRecordResult, Reader};
 use std::sync::Arc;
 
-use super::{CsvRecord, CsvRecordError, CsvRecordErrorHandler, NullRegex};
+use super::{CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler, NullRegex};
 
 #[derive(Debug)]
 struct QuotedEmptyFields {
@@ -463,12 +463,23 @@ impl RecordDecoder {
                                 actual_fields: self.current_field,
                                 record: &self.record_bytes,
                             })?;
-                            self.data_len = self.record_data_start;
-                            self.offsets_len = self.record_offsets_start;
-                            self.current_field = 0;
-                            self.line_number += 1;
-                            self.record_bytes.clear();
-                            self.record_byte_offset = self.stream_offset;
+                            self.skip_current_record();
+                            continue;
+                        }
+
+                        if let Err(error) =
+                            std::str::from_utf8(&self.data[self.record_data_start..self.data_len])
+                        {
+                            let field_index = self.offsets
+                                [self.record_offsets_start..self.offsets_len]
+                                .partition_point(|end| *end <= error.valid_up_to());
+                            handler.handle_invalid_utf8(&CsvInvalidUtf8Error {
+                                line_number: self.line_number,
+                                byte_offset: self.record_byte_offset,
+                                field_index,
+                                record: &self.record_bytes,
+                            })?;
+                            self.skip_current_record();
                             continue;
                         }
 
@@ -519,6 +530,15 @@ impl RecordDecoder {
                 }
             }
         }
+    }
+
+    fn skip_current_record(&mut self) {
+        self.data_len = self.record_data_start;
+        self.offsets_len = self.record_offsets_start;
+        self.current_field = 0;
+        self.line_number += 1;
+        self.record_bytes.clear();
+        self.record_byte_offset = self.stream_offset;
     }
 
     /// Returns the current number of buffered records
@@ -700,7 +720,7 @@ impl std::fmt::Display for StringRecord<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::reader::{CsvRecord, CsvRecordError, CsvRecordErrorHandler};
+    use crate::reader::{CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler};
     use arrow_schema::ArrowError;
     use csv_core::Reader;
     use std::io::{BufRead, BufReader, Cursor};
@@ -724,9 +744,18 @@ mod tests {
         record: Vec<u8>,
     }
 
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    struct OwnedInvalidUtf8Error {
+        line_number: usize,
+        byte_offset: usize,
+        field_index: usize,
+        record: Vec<u8>,
+    }
+
     #[derive(Debug, Default)]
     struct CollectRecords {
         errors: Mutex<Vec<OwnedRecordError>>,
+        invalid_utf8: Mutex<Vec<OwnedInvalidUtf8Error>>,
         records: Mutex<Vec<OwnedRecord>>,
     }
 
@@ -748,6 +777,19 @@ mod tests {
                 byte_offset: record.byte_offset,
                 record: record.record.to_vec(),
             });
+            Ok(())
+        }
+
+        fn handle_invalid_utf8(&self, error: &CsvInvalidUtf8Error<'_>) -> Result<(), ArrowError> {
+            self.invalid_utf8
+                .lock()
+                .unwrap()
+                .push(OwnedInvalidUtf8Error {
+                    line_number: error.line_number,
+                    byte_offset: error.byte_offset,
+                    field_index: error.field_index,
+                    record: error.record.to_vec(),
+                });
             Ok(())
         }
     }
@@ -890,6 +932,68 @@ mod tests {
                     record: b"4,after\n".to_vec(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_invalid_utf8_handler_skips_only_malformed_record_across_chunks() {
+        let csv = b"1,ok\n2,\xff\n3,after\n";
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let mut reader = BufReader::with_capacity(2, Cursor::new(csv));
+
+        loop {
+            let buf = reader.fill_buf().unwrap();
+            let (_, bytes) = decoder.decode(buf, 3 - decoder.len()).unwrap();
+            reader.consume(bytes);
+            if bytes == 0 || decoder.len() == 3 {
+                break;
+            }
+        }
+
+        let rows = decoder
+            .flush()
+            .unwrap()
+            .iter()
+            .map(|record| [record.get(0).to_owned(), record.get(1).to_owned()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                [String::from("1"), String::from("ok")],
+                [String::from("3"), String::from("after")],
+            ]
+        );
+        assert_eq!(
+            *handler.invalid_utf8.lock().unwrap(),
+            [OwnedInvalidUtf8Error {
+                line_number: 2,
+                byte_offset: 5,
+                field_index: 1,
+                record: b"2,\xff\n".to_vec(),
+            }]
+        );
+        assert_eq!(handler.records.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_invalid_utf8_handler_default_still_errors() {
+        #[derive(Debug)]
+        struct FieldCountOnly;
+
+        impl CsvRecordErrorHandler for FieldCountOnly {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+        }
+
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(Arc::new(FieldCountOnly)));
+        let error = decoder.decode(b"1,\xff\n", 1).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Csv error: Encountered invalid UTF-8 data for line 1 and field 2"
         );
     }
 
