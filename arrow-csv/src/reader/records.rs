@@ -263,6 +263,9 @@ pub struct RecordDecoder {
     /// Cache this capability once so the common recovery path avoids another virtual call.
     filter_records: bool,
 
+    /// Opt-in bound for a malformed record that never reaches a terminator.
+    max_record_bytes: Option<usize>,
+
     /// Opt-in replacement of malformed decoded UTF-8 fields.
     replace_invalid_utf8: bool,
 
@@ -309,6 +312,7 @@ impl RecordDecoder {
             truncated_rows,
             record_error_handler: None,
             filter_records: false,
+            max_record_bytes: None,
             replace_invalid_utf8: false,
             source_lines: SourceLineCounter {
                 lf_count: 0,
@@ -336,6 +340,9 @@ impl RecordDecoder {
         self.filter_records = handler
             .as_ref()
             .is_some_and(|handler| handler.filters_records());
+        self.max_record_bytes = handler
+            .as_ref()
+            .and_then(|handler| handler.max_record_bytes());
         self.record_error_handler = handler;
         self
     }
@@ -622,6 +629,17 @@ impl RecordDecoder {
                     })?;
                 if bom_stripped {
                     self.record_byte_offset = self.record_byte_offset.saturating_add(3);
+                }
+                if let Some(limit) = self.max_record_bytes
+                    && self
+                        .record_bytes
+                        .len()
+                        .saturating_add(input_offset.saturating_sub(record_input_start))
+                        > limit
+                {
+                    return Err(ArrowError::CsvError(format!(
+                        "CSV record exceeds the configured {limit} byte limit"
+                    )));
                 }
                 self.record_bytes.extend_from_slice(
                     &input[record_input_start + if bom_stripped { 3 } else { 0 }..input_offset],
@@ -1184,6 +1202,32 @@ mod tests {
             ]
         );
         assert_eq!(*handler.skipped.lock().unwrap(), [(2, 3, 14)]);
+    }
+
+    #[derive(Debug)]
+    struct LimitedRecord;
+
+    impl CsvRecordErrorHandler for LimitedRecord {
+        fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+
+        fn max_record_bytes(&self) -> Option<usize> {
+            Some(8)
+        }
+    }
+
+    #[test]
+    fn test_recovery_record_limit_bounds_unterminated_quote() {
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(Arc::new(LimitedRecord)));
+        let error = decoder.decode(b"1,\"unterminated", 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("CSV record exceeds the configured 8 byte limit"),
+            "{error}"
+        );
     }
 
     #[test]

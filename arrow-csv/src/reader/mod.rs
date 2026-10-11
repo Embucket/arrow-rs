@@ -270,6 +270,11 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
     fn skip_record(&self, _record: &CsvFilterRecord<'_>) -> Result<bool, ArrowError> {
         Ok(false)
     }
+
+    /// Optional upper bound for a raw record in the recovery decoder.
+    fn max_record_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Order should match [`InferredDataType`]
