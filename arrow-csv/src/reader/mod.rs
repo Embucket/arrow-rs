@@ -209,10 +209,36 @@ pub struct CsvRecord<'a> {
     pub record: &'a [u8],
 }
 
+/// Source metadata for a CSV record containing invalid UTF-8 in a decoded field.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CsvInvalidUtf8Error<'a> {
+    /// One-based record number, including any header row.
+    pub line_number: usize,
+    /// One-based physical line containing the start of the malformed record.
+    pub source_line_number: usize,
+    /// Zero-based byte offset of the start of the record in the input stream.
+    pub byte_offset: usize,
+    /// Zero-based index of the decoded field containing invalid UTF-8.
+    pub field_index: usize,
+    /// Original record bytes, including its record terminator when present.
+    pub record: &'a [u8],
+}
+
 /// Receives malformed CSV records that should be skipped instead of aborting the scan.
 pub trait CsvRecordErrorHandler: Debug + Send + Sync {
     /// Handle one malformed record. Returning an error aborts the scan.
     fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError>;
+
+    /// Handle a record with invalid UTF-8. Returning `Ok(())` skips only this record.
+    ///
+    /// The default preserves the reader's previous error behavior for existing handlers.
+    fn handle_invalid_utf8(&self, error: &CsvInvalidUtf8Error<'_>) -> Result<(), ArrowError> {
+        Err(ArrowError::CsvError(format!(
+            "Encountered invalid UTF-8 data for line {} and field {}",
+            error.line_number,
+            error.field_index + 1
+        )))
+    }
 
     /// Observe one successfully decoded record.
     ///
@@ -1072,7 +1098,7 @@ impl Decoder {
     pub fn decode(&mut self, buf: &[u8]) -> Result<usize, ArrowError> {
         if self.to_skip != 0 {
             if self.header_validation {
-                let (skipped, bytes) = self.record_decoder.decode(buf, 1)?;
+                let (skipped, bytes) = self.record_decoder.decode_validating_header(buf)?;
 
                 if skipped == 0 {
                     return Ok(bytes);
@@ -1087,7 +1113,7 @@ impl Decoder {
 
             // Skip in units of `to_read` to avoid over-allocating buffers
             let to_skip = self.to_skip.min(self.batch_size);
-            let (skipped, bytes) = self.record_decoder.decode(buf, to_skip)?;
+            let (skipped, bytes) = self.record_decoder.decode_skipping(buf, to_skip)?;
             self.to_skip -= skipped;
             self.record_decoder.clear();
             return Ok(bytes);
@@ -1794,7 +1820,15 @@ impl ReaderBuilder {
             self.schema.fields().len(),
             self.format.truncated_rows,
         )
-        .with_record_error_handler(self.record_error_handler);
+        .with_record_error_handler(self.record_error_handler)
+        .with_ignored_prefix_options(self.format.comment, self.format.terminator)
+        .with_utf8_preserving_syntax(
+            self.format.delimiter.is_none_or(|byte| byte.is_ascii())
+                && self.format.quote.is_none_or(|byte| byte.is_ascii())
+                && self.format.escape.is_none_or(|byte| byte.is_ascii())
+                && self.format.comment.is_none_or(|byte| byte.is_ascii())
+                && self.format.terminator.is_none_or(|byte| byte.is_ascii()),
+        );
         if self.format.preserve_quoted_empty {
             let quote = self.format.quote.unwrap_or(b'"');
             record_decoder = record_decoder.with_quoted_empty_tracking(
@@ -1831,6 +1865,138 @@ impl ReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct SkipMalformed;
+
+    impl CsvRecordErrorHandler for SkipMalformed {
+        fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+
+        fn handle_invalid_utf8(&self, _error: &CsvInvalidUtf8Error<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_invalid_utf8_skipped_header_preserves_first_data_row() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"header,\xff\n1,ok\n";
+        let batches = ReaderBuilder::new(schema)
+            .with_header(true)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build(Cursor::new(csv))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "1");
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "ok");
+    }
+
+    #[test]
+    fn test_invalid_utf8_validated_header_never_consumes_data_row() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"id,\xff\n1,ok\n";
+        let error = ReaderBuilder::new(schema)
+            .with_header(true)
+            .with_header_validation(true)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build(Cursor::new(csv))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid UTF-8 data for line 1 and field 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_utf8_recovery_across_single_byte_input_chunks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"1,\xc3\xa9\n2,\xff\n3,ok\n";
+        let input = std::io::BufReader::with_capacity(1, Cursor::new(csv));
+        let batches = ReaderBuilder::new(schema)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build_buffered(input)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "é");
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(1), "ok");
+    }
+
+    #[test]
+    fn test_invalid_utf8_recovery_with_single_row_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"1,ok\n2,\xff\n3,after\n";
+        let input = std::io::BufReader::with_capacity(4096, Cursor::new(csv));
+        let batches = ReaderBuilder::new(schema)
+            .with_batch_size(1)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build_buffered(input)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "ok");
+        assert_eq!(batches[1].column(1).as_string::<i32>().value(0), "after");
+    }
+
+    #[test]
+    #[ignore = "local small-batch CSV recovery throughput benchmark"]
+    fn bench_valid_unicode_csv_with_single_row_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = "1,é\n".repeat(100_000);
+        let input = std::io::BufReader::with_capacity(csv.len(), Cursor::new(csv.as_bytes()));
+        let start = std::time::Instant::now();
+        let rows: usize = ReaderBuilder::new(schema)
+            .with_batch_size(1)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build_buffered(input)
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 100_000);
+        eprintln!("single-row CSV recovery: {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn test_non_ascii_delimiter_disables_utf8_input_fast_path() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let batches = ReaderBuilder::new(schema)
+            .with_delimiter(0xa9)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build(Cursor::new("1éok\n"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
 
     #[test]
     fn test_decimal_inference_is_opt_in_and_bounded() {
