@@ -257,6 +257,9 @@ pub struct RecordDecoder {
     /// Optional recovery hook. Keeping this `None` selects the allocation-free strict path.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
 
+    /// Opt-in replacement of malformed decoded UTF-8 fields.
+    replace_invalid_utf8: bool,
+
     /// One-based physical source line, kept separate from the record ordinal.
     source_lines: SourceLineCounter,
 
@@ -299,6 +302,7 @@ impl RecordDecoder {
             quoted_empty: None,
             truncated_rows,
             record_error_handler: None,
+            replace_invalid_utf8: false,
             source_lines: SourceLineCounter {
                 lf_count: 0,
                 count_lf_independently: true,
@@ -323,6 +327,11 @@ impl RecordDecoder {
         handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     ) -> Self {
         self.record_error_handler = handler;
+        self
+    }
+
+    pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
+        self.replace_invalid_utf8 = replace;
         self
     }
 
@@ -690,21 +699,26 @@ impl RecordDecoder {
                         })
                         .flatten();
                         if let Some(field_index) = invalid_field {
-                            source_lines.advance(&input[counted_until..input_offset]);
-                            counted_until = input_offset;
-                            handler.handle_invalid_utf8(&CsvInvalidUtf8Error {
-                                line_number: self.line_number,
-                                source_line_number: source_lines.record_start_line(
-                                    usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
-                                    &self.record_bytes,
-                                ),
-                                byte_offset: self.record_byte_offset,
-                                field_index,
-                                record: &self.record_bytes,
-                            })?;
-                            self.skip_current_record();
-                            self.record_needs_utf8_validation = input_requires_utf8_validation;
-                            continue;
+                            if self.replace_invalid_utf8 {
+                                self.replace_invalid_utf8_fields()?;
+                            } else {
+                                source_lines.advance(&input[counted_until..input_offset]);
+                                counted_until = input_offset;
+                                handler.handle_invalid_utf8(&CsvInvalidUtf8Error {
+                                    line_number: self.line_number,
+                                    source_line_number: source_lines.record_start_line(
+                                        usize::try_from(self.delimiter.line())
+                                            .unwrap_or(usize::MAX),
+                                        &self.record_bytes,
+                                    ),
+                                    byte_offset: self.record_byte_offset,
+                                    field_index,
+                                    record: &self.record_bytes,
+                                })?;
+                                self.skip_current_record();
+                                self.record_needs_utf8_validation = input_requires_utf8_validation;
+                                continue;
+                            }
                         }
 
                         handler.handle_record(&CsvRecord {
@@ -778,6 +792,42 @@ impl RecordDecoder {
         self.record_byte_offset = self.stream_offset;
     }
 
+    fn replace_invalid_utf8_fields(&mut self) -> Result<(), ArrowError> {
+        let row = self.data[self.record_data_start..self.data_len].to_vec();
+        self.data.truncate(self.record_data_start);
+        let mut field_start = 0;
+        for end in &mut self.offsets[self.record_offsets_start..self.offsets_len] {
+            let field_end = *end;
+            let field = row.get(field_start..field_end).ok_or_else(|| {
+                ArrowError::CsvError("CSV decoded field offset is invalid".to_owned())
+            })?;
+            self.data
+                .extend_from_slice(String::from_utf8_lossy(field).as_bytes());
+            *end = self.data.len() - self.record_data_start;
+            field_start = field_end;
+        }
+        self.data_len = self.data.len();
+        Ok(())
+    }
+
+    fn replace_invalid_utf8_batch(&mut self) -> Result<(), ArrowError> {
+        let original = self.data[..self.data_len].to_vec();
+        self.data.clear();
+        let mut field_start = 0;
+        for end in &mut self.offsets[1..self.offsets_len] {
+            let field_end = *end;
+            let field = original.get(field_start..field_end).ok_or_else(|| {
+                ArrowError::CsvError("CSV decoded field offset is invalid".to_owned())
+            })?;
+            self.data
+                .extend_from_slice(String::from_utf8_lossy(field).as_bytes());
+            *end = self.data.len();
+            field_start = field_end;
+        }
+        self.data_len = self.data.len();
+        Ok(())
+    }
+
     /// Returns the current number of buffered records
     pub fn len(&self) -> usize {
         self.num_rows
@@ -823,6 +873,19 @@ impl RecordDecoder {
                     Ok(())
                 })
             })?;
+
+        if self.replace_invalid_utf8 && self.record_error_handler.is_none() {
+            let decoded = std::str::from_utf8(&self.data[..self.data_len]);
+            let invalid_field = match decoded {
+                Ok(data) => self.offsets[1..self.offsets_len]
+                    .iter()
+                    .any(|end| !data.is_char_boundary(*end)),
+                Err(_) => true,
+            };
+            if invalid_field {
+                self.replace_invalid_utf8_batch()?;
+            }
+        }
 
         // Need to truncate data t1o the actual amount of data read
         let data = std::str::from_utf8(&self.data[..self.data_len]).map_err(|e| {
@@ -1408,6 +1471,93 @@ mod tests {
         assert_eq!(errors[0].line_number, 2);
         assert_eq!(errors[0].source_line_number, 2);
         assert_eq!(errors[0].record, b"2,\"before\n\xff\"\n");
+    }
+
+    #[test]
+    fn test_replace_invalid_utf8_preserves_records_and_field_offsets() {
+        let csv = b"1,ok\n2,\xff\xfe,extra\n3,after\n";
+        let mut decoder =
+            RecordDecoder::new(Reader::new(), 3, true).with_replace_invalid_utf8(true);
+        let (rows, bytes) = decoder.decode(csv, 3).unwrap();
+        assert_eq!((rows, bytes), (3, csv.len()));
+        let records = decoder.flush().unwrap();
+        let values = records
+            .iter()
+            .map(|record| (record.get(0), record.get(1), record.get(2)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [("1", "ok", ""), ("2", "��", "extra"), ("3", "after", "")]
+        );
+    }
+
+    #[test]
+    fn test_replace_invalid_utf8_observes_repaired_record_without_error() {
+        let csv = b"1,\"bef\xffore\"\n2,after\n";
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_replace_invalid_utf8(true)
+            .with_record_error_handler(Some(handler.clone()));
+        let (rows, bytes) = decoder.decode(csv, 2).unwrap();
+        assert_eq!((rows, bytes), (2, csv.len()));
+        let records = decoder.flush().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.get(1))
+                .collect::<Vec<_>>(),
+            ["bef�ore", "after"]
+        );
+        assert!(handler.invalid_utf8.lock().unwrap().is_empty());
+        assert_eq!(handler.records.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_replace_invalid_utf8_does_not_replace_valid_split_unicode() {
+        let csv = "1,é\n".as_bytes();
+        let mut decoder =
+            RecordDecoder::new(Reader::new(), 2, false).with_replace_invalid_utf8(true);
+        let (first_rows, first_bytes) = decoder.decode(&csv[..3], 1).unwrap();
+        let (later_rows, later_bytes) = decoder.decode(&csv[3..], 1).unwrap();
+        assert_eq!(first_rows + later_rows, 1);
+        assert_eq!(first_bytes + later_bytes, csv.len());
+        let records = decoder.flush().unwrap();
+        assert_eq!(records.iter().next().unwrap().get(1), "é");
+    }
+
+    #[test]
+    fn test_replace_invalid_utf8_still_rejects_field_count_mismatch() {
+        let mut decoder =
+            RecordDecoder::new(Reader::new(), 2, false).with_replace_invalid_utf8(true);
+        let error = decoder.decode(b"1,ok,extra\n", 1).unwrap_err();
+        assert!(error.to_string().contains("incorrect number of fields"));
+    }
+
+    #[test]
+    fn test_replace_invalid_utf8_split_across_field_boundary() {
+        let mut decoder = RecordDecoder::new(Reader::new(), 3, false)
+            .with_utf8_preserving_syntax(true)
+            .with_replace_invalid_utf8(true);
+        let csv = b"1,\xc3,\xa9\n";
+        assert_eq!(decoder.decode(csv, 1).unwrap(), (1, csv.len()));
+        let records = decoder.flush().unwrap();
+        let record = records.iter().next().unwrap();
+        assert_eq!(
+            (record.get(0), record.get(1), record.get(2)),
+            ("1", "�", "�")
+        );
+    }
+
+    #[test]
+    fn test_replace_invalid_utf8_after_high_byte_quote() {
+        let mut builder = csv_core::ReaderBuilder::new();
+        builder.quote(b'\xc3');
+        let mut decoder =
+            RecordDecoder::new(builder.build(), 2, false).with_replace_invalid_utf8(true);
+        let csv = b"1,\xc3\xa9\xc3\xa9\n";
+        assert_eq!(decoder.decode(csv, 1).unwrap(), (1, csv.len()));
+        let records = decoder.flush().unwrap();
+        assert_eq!(records.iter().next().unwrap().get(1), "��");
     }
 
     #[test]
