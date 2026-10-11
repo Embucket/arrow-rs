@@ -695,7 +695,7 @@ impl RecordDecoder {
                             }
                             continue;
                         }
-                        if self.filter_records {
+                        if self.filter_records && handler.has_record_error(&self.record_bytes) {
                             source_lines.advance(&input[counted_until..input_offset]);
                             counted_until = input_offset;
                             if handler.skip_record(&CsvFilterRecord {
@@ -1156,6 +1156,10 @@ mod tests {
 
         fn filters_records(&self) -> bool {
             true
+        }
+
+        fn has_record_error(&self, record: &[u8]) -> bool {
+            record.starts_with(b"2,")
         }
 
         fn skip_record(&self, record: &CsvFilterRecord<'_>) -> Result<bool, ArrowError> {
@@ -1782,6 +1786,53 @@ mod tests {
     #[ignore = "local CSV record-handler throughput benchmark"]
     fn bench_valid_unicode_csv_with_record_handler() {
         bench_valid_csv_row("1,é\n".as_bytes());
+    }
+
+    #[test]
+    #[ignore = "local CSV record-handler throughput benchmark"]
+    fn bench_valid_quoted_csv_with_record_handler() {
+        bench_valid_csv_row(b"1,\"ok\"\n");
+    }
+
+    #[test]
+    #[ignore = "local CSV record-filter throughput benchmark"]
+    fn bench_valid_quoted_csv_with_record_filter() {
+        #[derive(Debug)]
+        struct QuotedRecordFilter;
+
+        impl CsvRecordErrorHandler for QuotedRecordFilter {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn filters_records(&self) -> bool {
+                true
+            }
+
+            fn has_record_error(&self, record: &[u8]) -> bool {
+                std::hint::black_box(record.contains(&b'"'));
+                false
+            }
+        }
+
+        const ROWS: usize = 100_000;
+        let csv = b"1,\"ok\"\n".repeat(ROWS);
+        let handler = Arc::new(QuotedRecordFilter);
+        let mut elapsed = Vec::new();
+        for _ in 0..6 {
+            let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                .with_ignored_prefix_options(None, None)
+                .with_utf8_preserving_syntax(true)
+                .with_record_error_handler(Some(handler.clone()));
+            let started = Instant::now();
+            let (rows, bytes) = decoder.decode(&csv, ROWS).unwrap();
+            let records = decoder.flush().unwrap();
+            assert_eq!(rows, ROWS);
+            assert_eq!(bytes, csv.len());
+            assert_eq!(records.len(), ROWS);
+            elapsed.push(started.elapsed());
+        }
+        println!("CSV quoted record filter times: {elapsed:?}");
     }
 
     fn bench_valid_csv_row(row: &[u8]) {

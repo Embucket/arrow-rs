@@ -266,7 +266,12 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
         false
     }
 
-    /// Return `true` to skip this record. Called only when [`Self::filters_records`] is true.
+    /// Cheap first pass; return `true` only when a record needs full source metadata.
+    fn has_record_error(&self, _record: &[u8]) -> bool {
+        false
+    }
+
+    /// Return `true` to skip this record after [`Self::has_record_error`] matched.
     fn skip_record(&self, _record: &CsvFilterRecord<'_>) -> Result<bool, ArrowError> {
         Ok(false)
     }
