@@ -31,6 +31,34 @@ struct QuotedEmptyFields {
     fields: Vec<u8>,
 }
 
+fn ignored_record_prefix(
+    raw: &[u8],
+    comment: Option<u8>,
+    terminator: Option<u8>,
+) -> (usize, usize) {
+    let mut offset = 0;
+    let mut lines = 0;
+    while let Some(&byte) = raw.get(offset) {
+        if Some(byte) == comment {
+            let Some(end) = raw[offset..].iter().position(|byte| *byte == b'\n') else {
+                break;
+            };
+            offset += end + 1;
+        } else if terminator.is_some_and(|term| byte == term) {
+            offset += 1;
+        } else if terminator.is_none() && byte == b'\r' {
+            offset += 1;
+            offset += usize::from(raw.get(offset) == Some(&b'\n'));
+        } else if terminator.is_none() && byte == b'\n' {
+            offset += 1;
+        } else {
+            break;
+        }
+        lines += 1;
+    }
+    (offset, lines)
+}
+
 impl QuotedEmptyFields {
     fn record(
         &mut self,
@@ -183,6 +211,13 @@ pub struct RecordDecoder {
     /// Optional recovery hook. Keeping this `None` selects the allocation-free strict path.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
 
+    /// Ignore record callbacks while skipping unvalidated header rows.
+    skipping_records: bool,
+
+    /// CSV syntax used to trim comments and blank lines from recovery callbacks.
+    comment: Option<u8>,
+    terminator: Option<u8>,
+
     /// Raw bytes for the current record, retained only by the recovery path.
     record_bytes: Vec<u8>,
 
@@ -211,6 +246,9 @@ impl RecordDecoder {
             quoted_empty: None,
             truncated_rows,
             record_error_handler: None,
+            skipping_records: false,
+            comment: None,
+            terminator: None,
             record_bytes: vec![],
             stream_offset: 0,
             record_byte_offset: 0,
@@ -224,6 +262,16 @@ impl RecordDecoder {
         handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     ) -> Self {
         self.record_error_handler = handler;
+        self
+    }
+
+    pub(super) fn with_ignored_prefix_options(
+        mut self,
+        comment: Option<u8>,
+        terminator: Option<u8>,
+    ) -> Self {
+        self.comment = comment;
+        self.terminator = terminator;
         self
     }
 
@@ -256,6 +304,17 @@ impl RecordDecoder {
             }
             None => self.decode_strict(input, to_read),
         }
+    }
+
+    pub(super) fn decode_skipping(
+        &mut self,
+        input: &[u8],
+        to_read: usize,
+    ) -> Result<(usize, usize), ArrowError> {
+        self.skipping_records = true;
+        let result = self.decode(input, to_read);
+        self.skipping_records = false;
+        result
     }
 
     fn decode_strict(
@@ -453,6 +512,25 @@ impl RecordDecoder {
                         self.offsets.resize(new_len, 0);
                     }
                     ReadRecordResult::Record => {
+                        let (ignored_bytes, ignored_lines) = ignored_record_prefix(
+                            &self.record_bytes,
+                            self.comment,
+                            self.terminator,
+                        );
+                        if ignored_bytes > 0 {
+                            self.record_bytes.drain(..ignored_bytes);
+                            self.record_byte_offset =
+                                self.record_byte_offset.saturating_add(ignored_bytes);
+                            self.line_number = self.line_number.saturating_add(ignored_lines);
+                        }
+                        if self.skipping_records {
+                            self.skip_current_record();
+                            read += 1;
+                            if read == to_read {
+                                return Ok((read, input_offset));
+                            }
+                            continue;
+                        }
                         if self.current_field != self.num_columns
                             && !(self.truncated_rows && self.current_field < self.num_columns)
                         {
@@ -467,12 +545,23 @@ impl RecordDecoder {
                             continue;
                         }
 
-                        if let Err(error) =
-                            std::str::from_utf8(&self.data[self.record_data_start..self.data_len])
-                        {
-                            let field_index = self.offsets
-                                [self.record_offsets_start..self.offsets_len]
-                                .partition_point(|end| *end <= error.valid_up_to());
+                        let row_data = &self.data[self.record_data_start..self.data_len];
+                        let invalid_field = (!row_data.is_ascii())
+                            .then(|| {
+                                let field_ends =
+                                    &self.offsets[self.record_offsets_start..self.offsets_len];
+                                match std::str::from_utf8(row_data) {
+                                    Ok(valid) => field_ends
+                                        .iter()
+                                        .position(|end| !valid.is_char_boundary(*end)),
+                                    Err(error) => Some(
+                                        field_ends
+                                            .partition_point(|end| *end <= error.valid_up_to()),
+                                    ),
+                                }
+                            })
+                            .flatten();
+                        if let Some(field_index) = invalid_field {
                             handler.handle_invalid_utf8(&CsvInvalidUtf8Error {
                                 line_number: self.line_number,
                                 byte_offset: self.record_byte_offset,
@@ -725,6 +814,7 @@ mod tests {
     use csv_core::Reader;
     use std::io::{BufRead, BufReader, Cursor};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     use super::{MAX_RECOVERABLE_EXCESS_FIELDS, RecordDecoder, recovery_limit_error};
 
@@ -995,6 +1085,137 @@ mod tests {
             error.to_string(),
             "Csv error: Encountered invalid UTF-8 data for line 1 and field 2"
         );
+    }
+
+    #[test]
+    fn test_invalid_utf8_cannot_cross_field_boundary() {
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let (rows, bytes) = decoder.decode(b"\xc3,\xa9\n1,ok\n", 2).unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(bytes, 9);
+        let records = decoder.flush().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get(0).get(0), "1");
+        assert_eq!(
+            *handler.invalid_utf8.lock().unwrap(),
+            [OwnedInvalidUtf8Error {
+                line_number: 1,
+                byte_offset: 0,
+                field_index: 0,
+                record: b"\xc3,\xa9\n".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_unicode_after_first_record_uses_relative_field_offsets() {
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let csv = "1,ok\n2,é\n".as_bytes();
+        let (rows, bytes) = decoder.decode(csv, 2).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(bytes, csv.len());
+        let records = decoder.flush().unwrap();
+        assert_eq!(records.get(1).get(1), "é");
+        assert!(handler.invalid_utf8.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_invalid_utf8_skipped_header_does_not_consume_data_row() {
+        let csv = b"bad,\xff\n1,ok\n";
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let (skipped, header_bytes) = decoder.decode_skipping(csv, 1).unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(header_bytes, 6);
+        decoder.clear();
+
+        let (rows, data_bytes) = decoder.decode(&csv[header_bytes..], 1).unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(header_bytes + data_bytes, csv.len());
+        let records = decoder.flush().unwrap();
+        assert_eq!(records.get(0).get(0), "1");
+        assert_eq!(records.get(0).get(1), "ok");
+        assert!(handler.invalid_utf8.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_invalid_utf8_after_comment_reports_only_data_record() {
+        let csv = b"1,ok\n#\xff ignored\n2,\xff\n3,after\n";
+        let mut builder = csv_core::ReaderBuilder::new();
+        builder.comment(Some(b'#'));
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(builder.build(), 2, false)
+            .with_ignored_prefix_options(Some(b'#'), None)
+            .with_record_error_handler(Some(handler.clone()));
+        let (rows, bytes) = decoder.decode(csv, 3).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(bytes, csv.len());
+        let errors = handler.invalid_utf8.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line_number, 3);
+        assert_eq!(errors[0].record, b"2,\xff\n");
+        assert_eq!(errors[0].byte_offset, 16);
+    }
+
+    #[test]
+    fn test_invalid_utf8_after_blank_line_reports_data_position() {
+        let csv = b"1,ok\n\n2,\xff\n3,after\n";
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let (rows, bytes) = decoder.decode(csv, 3).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(bytes, csv.len());
+        let errors = handler.invalid_utf8.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line_number, 3);
+        assert_eq!(errors[0].record, b"2,\xff\n");
+        assert_eq!(errors[0].byte_offset, 6);
+    }
+
+    #[test]
+    #[ignore = "local CSV record-handler throughput benchmark"]
+    fn bench_valid_csv_with_record_handler() {
+        bench_valid_csv_row(b"1,ok\n");
+    }
+
+    #[test]
+    #[ignore = "local CSV record-handler throughput benchmark"]
+    fn bench_valid_unicode_csv_with_record_handler() {
+        bench_valid_csv_row("1,é\n".as_bytes());
+    }
+
+    fn bench_valid_csv_row(row: &[u8]) {
+        #[derive(Debug)]
+        struct Noop;
+
+        impl CsvRecordErrorHandler for Noop {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+        }
+
+        const ROWS: usize = 100_000;
+        let csv = row.repeat(ROWS);
+        let handler = Arc::new(Noop);
+        let mut elapsed = Vec::new();
+        for _ in 0..6 {
+            let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                .with_record_error_handler(Some(handler.clone()));
+            let started = Instant::now();
+            let (rows, bytes) = decoder.decode(&csv, ROWS).unwrap();
+            let records = decoder.flush().unwrap();
+            assert_eq!(rows, ROWS);
+            assert_eq!(bytes, csv.len());
+            assert_eq!(records.len(), ROWS);
+            elapsed.push(started.elapsed());
+        }
+        println!("CSV record handler times: {elapsed:?}");
     }
 
     #[test]

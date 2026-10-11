@@ -1111,7 +1111,7 @@ impl Decoder {
 
             // Skip in units of `to_read` to avoid over-allocating buffers
             let to_skip = self.to_skip.min(self.batch_size);
-            let (skipped, bytes) = self.record_decoder.decode(buf, to_skip)?;
+            let (skipped, bytes) = self.record_decoder.decode_skipping(buf, to_skip)?;
             self.to_skip -= skipped;
             self.record_decoder.clear();
             return Ok(bytes);
@@ -1818,7 +1818,8 @@ impl ReaderBuilder {
             self.schema.fields().len(),
             self.format.truncated_rows,
         )
-        .with_record_error_handler(self.record_error_handler);
+        .with_record_error_handler(self.record_error_handler)
+        .with_ignored_prefix_options(self.format.comment, self.format.terminator);
         if self.format.preserve_quoted_empty {
             let quote = self.format.quote.unwrap_or(b'"');
             record_decoder = record_decoder.with_quoted_empty_tracking(
@@ -1855,6 +1856,42 @@ impl ReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_invalid_utf8_skipped_header_preserves_first_data_row() {
+        #[derive(Debug)]
+        struct SkipMalformed;
+
+        impl CsvRecordErrorHandler for SkipMalformed {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn handle_invalid_utf8(
+                &self,
+                _error: &CsvInvalidUtf8Error<'_>,
+            ) -> Result<(), ArrowError> {
+                Ok(())
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"header,\xff\n1,ok\n";
+        let batches = ReaderBuilder::new(schema)
+            .with_header(true)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build(Cursor::new(csv))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "1");
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "ok");
+    }
 
     #[test]
     fn test_decimal_inference_is_opt_in_and_bounded() {
