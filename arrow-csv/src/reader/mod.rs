@@ -1643,6 +1643,7 @@ pub struct ReaderBuilder {
     projection: Option<Vec<usize>>,
     /// Optional handler for records whose field count differs from the schema.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
+    replace_invalid_utf8: bool,
     numeric_boolean_values: bool,
 }
 
@@ -1677,6 +1678,7 @@ impl ReaderBuilder {
             bounds: None,
             projection: None,
             record_error_handler: None,
+            replace_invalid_utf8: false,
             numeric_boolean_values: false,
         }
     }
@@ -1796,6 +1798,13 @@ impl ReaderBuilder {
         self
     }
 
+    /// Replace malformed UTF-8 in decoded CSV fields with U+FFFD.
+    /// Disabled by default; only malformed records allocate replacement data.
+    pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
+        self.replace_invalid_utf8 = replace;
+        self
+    }
+
     /// Create a new `Reader` from a non-buffered reader
     ///
     /// If `R: BufRead` consider using [`Self::build_buffered`] to avoid unnecessary additional
@@ -1821,6 +1830,7 @@ impl ReaderBuilder {
             self.format.truncated_rows,
         )
         .with_record_error_handler(self.record_error_handler)
+        .with_replace_invalid_utf8(self.replace_invalid_utf8)
         .with_ignored_prefix_options(self.format.comment, self.format.terminator)
         .with_utf8_preserving_syntax(
             self.format.delimiter.is_none_or(|byte| byte.is_ascii())
@@ -1959,6 +1969,26 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "ok");
         assert_eq!(batches[1].column(1).as_string::<i32>().value(0), "after");
+    }
+
+    #[test]
+    fn test_replace_invalid_utf8_through_reader_builder() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"1,ok\n2,\xff\n3,after\n";
+        let batches = ReaderBuilder::new(schema)
+            .with_batch_size(1)
+            .with_replace_invalid_utf8(true)
+            .build(Cursor::new(csv))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "ok");
+        assert_eq!(batches[1].column(1).as_string::<i32>().value(0), "�");
+        assert_eq!(batches[2].column(1).as_string::<i32>().value(0), "after");
     }
 
     #[test]
