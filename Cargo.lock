@@ -315,6 +315,7 @@ dependencies = [
  "csv-core",
  "futures",
  "half",
+ "memchr",
  "regex",
  "tempfile",
  "tokio",

@@ -214,6 +214,8 @@ pub struct CsvRecord<'a> {
 pub struct CsvInvalidUtf8Error<'a> {
     /// One-based record number, including any header row.
     pub line_number: usize,
+    /// One-based physical line containing the start of the malformed record.
+    pub source_line_number: usize,
     /// Zero-based byte offset of the start of the record in the input stream.
     pub byte_offset: usize,
     /// Zero-based index of the decoded field containing invalid UTF-8.
@@ -1096,7 +1098,7 @@ impl Decoder {
     pub fn decode(&mut self, buf: &[u8]) -> Result<usize, ArrowError> {
         if self.to_skip != 0 {
             if self.header_validation {
-                let (skipped, bytes) = self.record_decoder.decode(buf, 1)?;
+                let (skipped, bytes) = self.record_decoder.decode_validating_header(buf)?;
 
                 if skipped == 0 {
                     return Ok(bytes);
@@ -1857,24 +1859,21 @@ impl ReaderBuilder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_invalid_utf8_skipped_header_preserves_first_data_row() {
-        #[derive(Debug)]
-        struct SkipMalformed;
+    #[derive(Debug)]
+    struct SkipMalformed;
 
-        impl CsvRecordErrorHandler for SkipMalformed {
-            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
-                Ok(())
-            }
-
-            fn handle_invalid_utf8(
-                &self,
-                _error: &CsvInvalidUtf8Error<'_>,
-            ) -> Result<(), ArrowError> {
-                Ok(())
-            }
+    impl CsvRecordErrorHandler for SkipMalformed {
+        fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            Ok(())
         }
 
+        fn handle_invalid_utf8(&self, _error: &CsvInvalidUtf8Error<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_invalid_utf8_skipped_header_preserves_first_data_row() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("msg", DataType::Utf8, false),
@@ -1891,6 +1890,29 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 1);
         assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "1");
         assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "ok");
+    }
+
+    #[test]
+    fn test_invalid_utf8_validated_header_never_consumes_data_row() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"id,\xff\n1,ok\n";
+        let error = ReaderBuilder::new(schema)
+            .with_header(true)
+            .with_header_validation(true)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build(Cursor::new(csv))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid UTF-8 data for line 1 and field 2"),
+            "{error}"
+        );
     }
 
     #[test]
