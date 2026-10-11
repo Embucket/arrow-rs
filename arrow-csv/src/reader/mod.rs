@@ -1821,7 +1821,14 @@ impl ReaderBuilder {
             self.format.truncated_rows,
         )
         .with_record_error_handler(self.record_error_handler)
-        .with_ignored_prefix_options(self.format.comment, self.format.terminator);
+        .with_ignored_prefix_options(self.format.comment, self.format.terminator)
+        .with_utf8_preserving_syntax(
+            self.format.delimiter.is_none_or(|byte| byte.is_ascii())
+                && self.format.quote.is_none_or(|byte| byte.is_ascii())
+                && self.format.escape.is_none_or(|byte| byte.is_ascii())
+                && self.format.comment.is_none_or(|byte| byte.is_ascii())
+                && self.format.terminator.is_none_or(|byte| byte.is_ascii()),
+        );
         if self.format.preserve_quoted_empty {
             let quote = self.format.quote.unwrap_or(b'"');
             record_decoder = record_decoder.with_quoted_empty_tracking(
@@ -1913,6 +1920,82 @@ mod tests {
                 .contains("invalid UTF-8 data for line 1 and field 2"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn test_invalid_utf8_recovery_across_single_byte_input_chunks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"1,\xc3\xa9\n2,\xff\n3,ok\n";
+        let input = std::io::BufReader::with_capacity(1, Cursor::new(csv));
+        let batches = ReaderBuilder::new(schema)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build_buffered(input)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "é");
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(1), "ok");
+    }
+
+    #[test]
+    fn test_invalid_utf8_recovery_with_single_row_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = b"1,ok\n2,\xff\n3,after\n";
+        let input = std::io::BufReader::with_capacity(4096, Cursor::new(csv));
+        let batches = ReaderBuilder::new(schema)
+            .with_batch_size(1)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build_buffered(input)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].column(1).as_string::<i32>().value(0), "ok");
+        assert_eq!(batches[1].column(1).as_string::<i32>().value(0), "after");
+    }
+
+    #[test]
+    #[ignore = "local small-batch CSV recovery throughput benchmark"]
+    fn bench_valid_unicode_csv_with_single_row_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let csv = "1,é\n".repeat(100_000);
+        let input = std::io::BufReader::with_capacity(csv.len(), Cursor::new(csv.as_bytes()));
+        let start = std::time::Instant::now();
+        let rows: usize = ReaderBuilder::new(schema)
+            .with_batch_size(1)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build_buffered(input)
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 100_000);
+        eprintln!("single-row CSV recovery: {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn test_non_ascii_delimiter_disables_utf8_input_fast_path() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let batches = ReaderBuilder::new(schema)
+            .with_delimiter(0xa9)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build(Cursor::new("1éok\n"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
     }
 
     #[test]

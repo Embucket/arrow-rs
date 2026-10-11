@@ -28,6 +28,7 @@ struct QuotedEmptyFields {
     escape: Option<u8>,
     comment: Option<u8>,
     terminator: Option<u8>,
+
     fields: Vec<u8>,
 }
 
@@ -61,7 +62,7 @@ fn count_source_line_breaks(raw: &[u8]) -> usize {
 
 #[derive(Clone, Copy, Debug)]
 struct SourceLineCounter {
-    line_number: usize,
+    bare_cr_count: usize,
     pending_cr: bool,
 }
 
@@ -69,26 +70,25 @@ impl SourceLineCounter {
     fn advance(&mut self, bytes: &[u8]) {
         if let Some(&first) = bytes.first() {
             if self.pending_cr && first != b'\n' {
-                self.line_number = self.line_number.saturating_add(1);
+                self.bare_cr_count = self.bare_cr_count.saturating_add(1);
             }
             self.pending_cr = false;
         }
-        self.line_number = self
-            .line_number
-            .saturating_add(bytes.iter().filter(|&&byte| byte == b'\n').count());
         for index in memchr::memchr_iter(b'\r', bytes) {
             match bytes.get(index + 1) {
                 Some(b'\n') => {}
                 None => self.pending_cr = true,
-                _ => self.line_number = self.line_number.saturating_add(1),
+                _ => self.bare_cr_count = self.bare_cr_count.saturating_add(1),
             }
         }
     }
 
-    fn record_start_line(self, record: &[u8]) -> usize {
-        let end_line = self.line_number.saturating_add(usize::from(
-            self.pending_cr && record.last() == Some(&b'\r'),
-        ));
+    fn record_start_line(self, parser_line: usize, record: &[u8]) -> usize {
+        let end_line = parser_line
+            .saturating_add(self.bare_cr_count)
+            .saturating_add(usize::from(
+                self.pending_cr && record.last() == Some(&b'\r'),
+            ));
         end_line.saturating_sub(count_source_line_breaks(record))
     }
 }
@@ -255,6 +255,10 @@ pub struct RecordDecoder {
     comment: Option<u8>,
     terminator: Option<u8>,
 
+    /// A valid UTF-8 input buffer remains valid after removing ASCII CSV syntax.
+    utf8_preserving_syntax: bool,
+    record_needs_utf8_validation: bool,
+
     /// Raw bytes for the current record, retained only by the recovery path.
     record_bytes: Vec<u8>,
 
@@ -284,12 +288,14 @@ impl RecordDecoder {
             truncated_rows,
             record_error_handler: None,
             source_lines: SourceLineCounter {
-                line_number: 1,
+                bare_cr_count: 0,
                 pending_cr: false,
             },
             skipping_records: false,
             comment: None,
             terminator: None,
+            utf8_preserving_syntax: false,
+            record_needs_utf8_validation: false,
             record_bytes: vec![],
             stream_offset: 0,
             record_byte_offset: 0,
@@ -313,6 +319,11 @@ impl RecordDecoder {
     ) -> Self {
         self.comment = comment;
         self.terminator = terminator;
+        self
+    }
+
+    pub(super) fn with_utf8_preserving_syntax(mut self, enabled: bool) -> Self {
+        self.utf8_preserving_syntax = enabled;
         self
     }
 
@@ -384,6 +395,9 @@ impl RecordDecoder {
     ) -> (usize, usize) {
         source_lines.advance(&input[counted_until..consumed]);
         self.source_lines = source_lines;
+        if self.record_bytes.is_empty() {
+            self.record_needs_utf8_validation = false;
+        }
         (read, consumed)
     }
 
@@ -521,6 +535,14 @@ impl RecordDecoder {
             return Ok((0, 0));
         }
 
+        // The reader can pass the same unread tail again after a full batch. Bound
+        // preflight work per requested row so small batches do not rescan that tail.
+        const MAX_PREFLIGHT_BYTES_PER_ROW: usize = 64;
+        let input_requires_utf8_validation = !self.utf8_preserving_syntax
+            || input.len() > to_read.saturating_mul(MAX_PREFLIGHT_BYTES_PER_ROW)
+            || std::str::from_utf8(input).is_err();
+        self.record_needs_utf8_validation |= input_requires_utf8_validation;
+
         let required_offsets = to_read
             .checked_mul(self.num_columns)
             .and_then(|additional| self.offsets_len.checked_add(additional))
@@ -608,6 +630,7 @@ impl RecordDecoder {
                         }
                         if self.skipping_records {
                             self.skip_current_record();
+                            self.record_needs_utf8_validation = input_requires_utf8_validation;
                             read += 1;
                             if read == to_read {
                                 return Ok(self.complete_recovery(
@@ -631,37 +654,41 @@ impl RecordDecoder {
                                 record: &self.record_bytes,
                             })?;
                             self.skip_current_record();
+                            self.record_needs_utf8_validation = input_requires_utf8_validation;
                             continue;
                         }
 
                         let row_data = &self.data[self.record_data_start..self.data_len];
-                        let invalid_field = (!row_data.is_ascii())
-                            .then(|| {
-                                let field_ends =
-                                    &self.offsets[self.record_offsets_start..self.offsets_len];
-                                match std::str::from_utf8(row_data) {
-                                    Ok(valid) => field_ends
-                                        .iter()
-                                        .position(|end| !valid.is_char_boundary(*end)),
-                                    Err(error) => Some(
-                                        field_ends
-                                            .partition_point(|end| *end <= error.valid_up_to()),
-                                    ),
-                                }
-                            })
-                            .flatten();
+                        let invalid_field = (self.record_needs_utf8_validation
+                            && !row_data.is_ascii())
+                        .then(|| {
+                            let field_ends =
+                                &self.offsets[self.record_offsets_start..self.offsets_len];
+                            match std::str::from_utf8(row_data) {
+                                Ok(valid) => field_ends
+                                    .iter()
+                                    .position(|end| !valid.is_char_boundary(*end)),
+                                Err(error) => Some(
+                                    field_ends.partition_point(|end| *end <= error.valid_up_to()),
+                                ),
+                            }
+                        })
+                        .flatten();
                         if let Some(field_index) = invalid_field {
                             source_lines.advance(&input[counted_until..input_offset]);
                             counted_until = input_offset;
                             handler.handle_invalid_utf8(&CsvInvalidUtf8Error {
                                 line_number: self.line_number,
-                                source_line_number: source_lines
-                                    .record_start_line(&self.record_bytes),
+                                source_line_number: source_lines.record_start_line(
+                                    usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
+                                    &self.record_bytes,
+                                ),
                                 byte_offset: self.record_byte_offset,
                                 field_index,
                                 record: &self.record_bytes,
                             })?;
                             self.skip_current_record();
+                            self.record_needs_utf8_validation = input_requires_utf8_validation;
                             continue;
                         }
 
@@ -698,6 +725,7 @@ impl RecordDecoder {
                         self.line_number += 1;
                         self.num_rows += 1;
                         self.record_bytes.clear();
+                        self.record_needs_utf8_validation = input_requires_utf8_validation;
                         self.record_byte_offset = self.stream_offset;
                         self.record_data_start = self.data_len;
                         self.record_offsets_start = self.offsets_len;
@@ -1390,6 +1418,26 @@ mod tests {
     }
 
     #[test]
+    fn test_source_lines_with_bare_cr_across_input_chunks() {
+        let csv = b"1,ok\r2,\xff\r3,after\r";
+        let mut builder = csv_core::ReaderBuilder::new();
+        builder.terminator(csv_core::Terminator::Any(b'\r'));
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(builder.build(), 2, false)
+            .with_ignored_prefix_options(None, Some(b'\r'))
+            .with_record_error_handler(Some(handler.clone()));
+        let (first_rows, first_bytes) = decoder.decode(&csv[..5], 3).unwrap();
+        let (later_rows, later_bytes) = decoder.decode(&csv[5..], 3).unwrap();
+        assert_eq!(first_rows + later_rows, 2);
+        assert_eq!(first_bytes + later_bytes, csv.len());
+        let errors = handler.invalid_utf8.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line_number, 2);
+        assert_eq!(errors[0].source_line_number, 2);
+        assert_eq!(errors[0].byte_offset, 5);
+    }
+
+    #[test]
     #[ignore = "local CSV record-handler throughput benchmark"]
     fn bench_valid_csv_with_record_handler() {
         bench_valid_csv_row(b"1,ok\n");
@@ -1417,6 +1465,7 @@ mod tests {
         let mut elapsed = Vec::new();
         for _ in 0..6 {
             let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                .with_utf8_preserving_syntax(true)
                 .with_record_error_handler(Some(handler.clone()));
             let started = Instant::now();
             let (rows, bytes) = decoder.decode(&csv, ROWS).unwrap();
