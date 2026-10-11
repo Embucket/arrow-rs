@@ -1393,6 +1393,24 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_utf8_inside_multiline_record_skips_whole_record() {
+        let csv = b"1,ok\n2,\"before\n\xff\"\n3,after\n";
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_ignored_prefix_options(None, None)
+            .with_utf8_preserving_syntax(true)
+            .with_record_error_handler(Some(handler.clone()));
+        let (rows, bytes) = decoder.decode(csv, 3).unwrap();
+        assert_eq!(bytes, csv.len());
+        assert_eq!(rows, 2);
+        let errors = handler.invalid_utf8.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line_number, 2);
+        assert_eq!(errors[0].source_line_number, 2);
+        assert_eq!(errors[0].record, b"2,\"before\n\xff\"\n");
+    }
+
+    #[test]
     fn test_validated_header_preserves_later_recovery_offsets() {
         let csv = b"id,msg\n2,\xff\n";
         let handler = Arc::new(CollectRecords::default());
