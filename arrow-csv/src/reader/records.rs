@@ -19,7 +19,10 @@ use arrow_schema::ArrowError;
 use csv_core::{ReadRecordResult, Reader};
 use std::sync::Arc;
 
-use super::{CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler, NullRegex};
+use super::{
+    CsvFilterRecord, CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler,
+    NullRegex,
+};
 
 #[derive(Debug)]
 struct QuotedEmptyFields {
@@ -257,6 +260,9 @@ pub struct RecordDecoder {
     /// Optional recovery hook. Keeping this `None` selects the allocation-free strict path.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
 
+    /// Cache this capability once so the common recovery path avoids another virtual call.
+    filter_records: bool,
+
     /// Opt-in replacement of malformed decoded UTF-8 fields.
     replace_invalid_utf8: bool,
 
@@ -302,6 +308,7 @@ impl RecordDecoder {
             quoted_empty: None,
             truncated_rows,
             record_error_handler: None,
+            filter_records: false,
             replace_invalid_utf8: false,
             source_lines: SourceLineCounter {
                 lf_count: 0,
@@ -326,6 +333,9 @@ impl RecordDecoder {
         mut self,
         handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     ) -> Self {
+        self.filter_records = handler
+            .as_ref()
+            .is_some_and(|handler| handler.filters_records());
         self.record_error_handler = handler;
         self
     }
@@ -666,6 +676,23 @@ impl RecordDecoder {
                                 ));
                             }
                             continue;
+                        }
+                        if self.filter_records {
+                            source_lines.advance(&input[counted_until..input_offset]);
+                            counted_until = input_offset;
+                            if handler.skip_record(&CsvFilterRecord {
+                                line_number: self.line_number,
+                                source_line_number: source_lines.record_start_line(
+                                    usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
+                                    &self.record_bytes,
+                                ),
+                                byte_offset: self.record_byte_offset,
+                                record: &self.record_bytes,
+                            })? {
+                                self.skip_current_record();
+                                self.record_needs_utf8_validation = input_requires_utf8_validation;
+                                continue;
+                            }
                         }
                         if self.current_field != self.num_columns
                             && !(self.truncated_rows && self.current_field < self.num_columns)
@@ -1020,7 +1047,9 @@ impl std::fmt::Display for StringRecord<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::reader::{CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler};
+    use crate::reader::{
+        CsvFilterRecord, CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler,
+    };
     use arrow_schema::ArrowError;
     use csv_core::Reader;
     use std::io::{BufRead, BufReader, Cursor};
@@ -1095,6 +1124,66 @@ mod tests {
                 });
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct SkipSecondRecord {
+        skipped: Mutex<Vec<(usize, usize, usize)>>,
+    }
+
+    impl CsvRecordErrorHandler for SkipSecondRecord {
+        fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+
+        fn filters_records(&self) -> bool {
+            true
+        }
+
+        fn skip_record(&self, record: &CsvFilterRecord<'_>) -> Result<bool, ArrowError> {
+            if record.record.starts_with(b"2,") {
+                self.skipped.lock().unwrap().push((
+                    record.line_number,
+                    record.source_line_number,
+                    record.byte_offset,
+                ));
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn test_record_filter_skips_one_row_and_tracks_physical_line_across_chunks() {
+        let csv = b"1,\"two\nlines\"\n2,bad\n3,after\n";
+        let handler = Arc::new(SkipSecondRecord::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let mut reader = BufReader::with_capacity(2, Cursor::new(csv));
+
+        loop {
+            let buf = reader.fill_buf().unwrap();
+            let (_, bytes) = decoder.decode(buf, 3 - decoder.len()).unwrap();
+            reader.consume(bytes);
+            if bytes == 0 || decoder.len() == 3 {
+                break;
+            }
+        }
+
+        let rows = decoder
+            .flush()
+            .unwrap()
+            .iter()
+            .map(|record| [record.get(0).to_owned(), record.get(1).to_owned()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                ["1".to_owned(), "two\nlines".to_owned()],
+                ["3".to_owned(), "after".to_owned()]
+            ]
+        );
+        assert_eq!(*handler.skipped.lock().unwrap(), [(2, 3, 14)]);
     }
 
     #[test]
