@@ -62,12 +62,19 @@ fn count_source_line_breaks(raw: &[u8]) -> usize {
 
 #[derive(Clone, Copy, Debug)]
 struct SourceLineCounter {
+    lf_count: usize,
+    count_lf_independently: bool,
     bare_cr_count: usize,
     pending_cr: bool,
 }
 
 impl SourceLineCounter {
     fn advance(&mut self, bytes: &[u8]) {
+        if self.count_lf_independently {
+            self.lf_count = self
+                .lf_count
+                .saturating_add(memchr::memchr_iter(b'\n', bytes).count());
+        }
         if let Some(&first) = bytes.first() {
             if self.pending_cr && first != b'\n' {
                 self.bare_cr_count = self.bare_cr_count.saturating_add(1);
@@ -84,7 +91,12 @@ impl SourceLineCounter {
     }
 
     fn record_start_line(self, parser_line: usize, record: &[u8]) -> usize {
-        let end_line = parser_line
+        let lf_line = if self.count_lf_independently {
+            self.lf_count.saturating_add(1)
+        } else {
+            parser_line
+        };
+        let end_line = lf_line
             .saturating_add(self.bare_cr_count)
             .saturating_add(usize::from(
                 self.pending_cr && record.last() == Some(&b'\r'),
@@ -288,6 +300,8 @@ impl RecordDecoder {
             truncated_rows,
             record_error_handler: None,
             source_lines: SourceLineCounter {
+                lf_count: 0,
+                count_lf_independently: true,
                 bare_cr_count: 0,
                 pending_cr: false,
             },
@@ -319,6 +333,7 @@ impl RecordDecoder {
     ) -> Self {
         self.comment = comment;
         self.terminator = terminator;
+        self.source_lines.count_lf_independently = terminator.is_some();
         self
     }
 
@@ -1438,6 +1453,25 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_terminator_counts_newlines_inside_fields() {
+        let csv = b"1,a\nb|2,\xff|";
+        let mut builder = csv_core::ReaderBuilder::new();
+        builder.terminator(csv_core::Terminator::Any(b'|'));
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(builder.build(), 2, false)
+            .with_ignored_prefix_options(None, Some(b'|'))
+            .with_record_error_handler(Some(handler.clone()));
+        let (rows, bytes) = decoder.decode(csv, 2).unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(bytes, csv.len());
+        let errors = handler.invalid_utf8.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line_number, 2);
+        assert_eq!(errors[0].source_line_number, 2);
+        assert_eq!(errors[0].byte_offset, 6);
+    }
+
+    #[test]
     #[ignore = "local CSV record-handler throughput benchmark"]
     fn bench_valid_csv_with_record_handler() {
         bench_valid_csv_row(b"1,ok\n");
@@ -1465,6 +1499,7 @@ mod tests {
         let mut elapsed = Vec::new();
         for _ in 0..6 {
             let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                .with_ignored_prefix_options(None, None)
                 .with_utf8_preserving_syntax(true)
                 .with_record_error_handler(Some(handler.clone()));
             let started = Instant::now();
