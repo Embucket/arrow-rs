@@ -209,6 +209,19 @@ pub struct CsvRecord<'a> {
     pub record: &'a [u8],
 }
 
+/// Source metadata for an opt-in record filter in the recovery decoder.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CsvFilterRecord<'a> {
+    /// One-based record number, including any header row.
+    pub line_number: usize,
+    /// One-based physical line containing the start of the record.
+    pub source_line_number: usize,
+    /// Zero-based byte offset of the start of the record in the input stream.
+    pub byte_offset: usize,
+    /// Original record bytes, including its record terminator when present.
+    pub record: &'a [u8],
+}
+
 /// Source metadata for a CSV record containing invalid UTF-8 in a decoded field.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct CsvInvalidUtf8Error<'a> {
@@ -246,6 +259,26 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
     /// implementation preserves the existing malformed-record-only behavior.
     fn handle_record(&self, _record: &CsvRecord<'_>) -> Result<(), ArrowError> {
         Ok(())
+    }
+
+    /// Opt in to filtering decoded records before they enter a batch.
+    fn filters_records(&self) -> bool {
+        false
+    }
+
+    /// Cheap first pass; return `true` only when a record needs full source metadata.
+    fn has_record_error(&self, _record: &[u8]) -> bool {
+        false
+    }
+
+    /// Return `true` to skip this record after [`Self::has_record_error`] matched.
+    fn skip_record(&self, _record: &CsvFilterRecord<'_>) -> Result<bool, ArrowError> {
+        Ok(false)
+    }
+
+    /// Optional upper bound for a raw record in the recovery decoder.
+    fn max_record_bytes(&self) -> Option<usize> {
+        None
     }
 }
 

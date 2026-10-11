@@ -19,7 +19,10 @@ use arrow_schema::ArrowError;
 use csv_core::{ReadRecordResult, Reader};
 use std::sync::Arc;
 
-use super::{CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler, NullRegex};
+use super::{
+    CsvFilterRecord, CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler,
+    NullRegex,
+};
 
 #[derive(Debug)]
 struct QuotedEmptyFields {
@@ -257,6 +260,12 @@ pub struct RecordDecoder {
     /// Optional recovery hook. Keeping this `None` selects the allocation-free strict path.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
 
+    /// Cache this capability once so the common recovery path avoids another virtual call.
+    filter_records: bool,
+
+    /// Opt-in bound for a malformed record that never reaches a terminator.
+    max_record_bytes: Option<usize>,
+
     /// Opt-in replacement of malformed decoded UTF-8 fields.
     replace_invalid_utf8: bool,
 
@@ -302,6 +311,8 @@ impl RecordDecoder {
             quoted_empty: None,
             truncated_rows,
             record_error_handler: None,
+            filter_records: false,
+            max_record_bytes: None,
             replace_invalid_utf8: false,
             source_lines: SourceLineCounter {
                 lf_count: 0,
@@ -326,6 +337,12 @@ impl RecordDecoder {
         mut self,
         handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     ) -> Self {
+        self.filter_records = handler
+            .as_ref()
+            .is_some_and(|handler| handler.filters_records());
+        self.max_record_bytes = handler
+            .as_ref()
+            .and_then(|handler| handler.max_record_bytes());
         self.record_error_handler = handler;
         self
     }
@@ -613,6 +630,17 @@ impl RecordDecoder {
                 if bom_stripped {
                     self.record_byte_offset = self.record_byte_offset.saturating_add(3);
                 }
+                if let Some(limit) = self.max_record_bytes
+                    && self
+                        .record_bytes
+                        .len()
+                        .saturating_add(input_offset.saturating_sub(record_input_start))
+                        > limit
+                {
+                    return Err(ArrowError::CsvError(format!(
+                        "CSV record exceeds the configured {limit} byte limit"
+                    )));
+                }
                 self.record_bytes.extend_from_slice(
                     &input[record_input_start + if bom_stripped { 3 } else { 0 }..input_offset],
                 );
@@ -666,6 +694,23 @@ impl RecordDecoder {
                                 ));
                             }
                             continue;
+                        }
+                        if self.filter_records && handler.has_record_error(&self.record_bytes) {
+                            source_lines.advance(&input[counted_until..input_offset]);
+                            counted_until = input_offset;
+                            if handler.skip_record(&CsvFilterRecord {
+                                line_number: self.line_number,
+                                source_line_number: source_lines.record_start_line(
+                                    usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
+                                    &self.record_bytes,
+                                ),
+                                byte_offset: self.record_byte_offset,
+                                record: &self.record_bytes,
+                            })? {
+                                self.skip_current_record();
+                                self.record_needs_utf8_validation = input_requires_utf8_validation;
+                                continue;
+                            }
                         }
                         if self.current_field != self.num_columns
                             && !(self.truncated_rows && self.current_field < self.num_columns)
@@ -1020,7 +1065,9 @@ impl std::fmt::Display for StringRecord<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::reader::{CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler};
+    use crate::reader::{
+        CsvFilterRecord, CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler,
+    };
     use arrow_schema::ArrowError;
     use csv_core::Reader;
     use std::io::{BufRead, BufReader, Cursor};
@@ -1095,6 +1142,96 @@ mod tests {
                 });
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct SkipSecondRecord {
+        skipped: Mutex<Vec<(usize, usize, usize)>>,
+    }
+
+    impl CsvRecordErrorHandler for SkipSecondRecord {
+        fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+
+        fn filters_records(&self) -> bool {
+            true
+        }
+
+        fn has_record_error(&self, record: &[u8]) -> bool {
+            record.starts_with(b"2,")
+        }
+
+        fn skip_record(&self, record: &CsvFilterRecord<'_>) -> Result<bool, ArrowError> {
+            if record.record.starts_with(b"2,") {
+                self.skipped.lock().unwrap().push((
+                    record.line_number,
+                    record.source_line_number,
+                    record.byte_offset,
+                ));
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn test_record_filter_skips_one_row_and_tracks_physical_line_across_chunks() {
+        let csv = b"1,\"two\nlines\"\n2,bad\n3,after\n";
+        let handler = Arc::new(SkipSecondRecord::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let mut reader = BufReader::with_capacity(2, Cursor::new(csv));
+
+        loop {
+            let buf = reader.fill_buf().unwrap();
+            let (_, bytes) = decoder.decode(buf, 3 - decoder.len()).unwrap();
+            reader.consume(bytes);
+            if bytes == 0 || decoder.len() == 3 {
+                break;
+            }
+        }
+
+        let rows = decoder
+            .flush()
+            .unwrap()
+            .iter()
+            .map(|record| [record.get(0).to_owned(), record.get(1).to_owned()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                ["1".to_owned(), "two\nlines".to_owned()],
+                ["3".to_owned(), "after".to_owned()]
+            ]
+        );
+        assert_eq!(*handler.skipped.lock().unwrap(), [(2, 3, 14)]);
+    }
+
+    #[derive(Debug)]
+    struct LimitedRecord;
+
+    impl CsvRecordErrorHandler for LimitedRecord {
+        fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+
+        fn max_record_bytes(&self) -> Option<usize> {
+            Some(8)
+        }
+    }
+
+    #[test]
+    fn test_recovery_record_limit_bounds_unterminated_quote() {
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(Arc::new(LimitedRecord)));
+        let error = decoder.decode(b"1,\"unterminated", 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("CSV record exceeds the configured 8 byte limit"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1649,6 +1786,53 @@ mod tests {
     #[ignore = "local CSV record-handler throughput benchmark"]
     fn bench_valid_unicode_csv_with_record_handler() {
         bench_valid_csv_row("1,é\n".as_bytes());
+    }
+
+    #[test]
+    #[ignore = "local CSV record-handler throughput benchmark"]
+    fn bench_valid_quoted_csv_with_record_handler() {
+        bench_valid_csv_row(b"1,\"ok\"\n");
+    }
+
+    #[test]
+    #[ignore = "local CSV record-filter throughput benchmark"]
+    fn bench_valid_quoted_csv_with_record_filter() {
+        #[derive(Debug)]
+        struct QuotedRecordFilter;
+
+        impl CsvRecordErrorHandler for QuotedRecordFilter {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn filters_records(&self) -> bool {
+                true
+            }
+
+            fn has_record_error(&self, record: &[u8]) -> bool {
+                std::hint::black_box(record.contains(&b'"'));
+                false
+            }
+        }
+
+        const ROWS: usize = 100_000;
+        let csv = b"1,\"ok\"\n".repeat(ROWS);
+        let handler = Arc::new(QuotedRecordFilter);
+        let mut elapsed = Vec::new();
+        for _ in 0..6 {
+            let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                .with_ignored_prefix_options(None, None)
+                .with_utf8_preserving_syntax(true)
+                .with_record_error_handler(Some(handler.clone()));
+            let started = Instant::now();
+            let (rows, bytes) = decoder.decode(&csv, ROWS).unwrap();
+            let records = decoder.flush().unwrap();
+            assert_eq!(rows, ROWS);
+            assert_eq!(bytes, csv.len());
+            assert_eq!(records.len(), ROWS);
+            elapsed.push(started.elapsed());
+        }
+        println!("CSV quoted record filter times: {elapsed:?}");
     }
 
     fn bench_valid_csv_row(row: &[u8]) {
