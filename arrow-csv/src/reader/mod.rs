@@ -1735,6 +1735,7 @@ pub struct ReaderBuilder {
     projection: Option<Vec<usize>>,
     /// Optional handler for records whose field count differs from the schema.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
+    ignore_extra_fields: bool,
     numeric_boolean_values: bool,
 }
 
@@ -1769,6 +1770,7 @@ impl ReaderBuilder {
             bounds: None,
             projection: None,
             record_error_handler: None,
+            ignore_extra_fields: false,
             numeric_boolean_values: false,
         }
     }
@@ -1871,6 +1873,13 @@ impl ReaderBuilder {
         self
     }
 
+    /// Ignore fields after the schema's last column while decoding each record.
+    /// Disabled by default; missing fields still follow [`Self::with_truncated_rows`].
+    pub fn with_ignore_extra_fields(mut self, ignore: bool) -> Self {
+        self.ignore_extra_fields = ignore;
+        self
+    }
+
     /// Accept `0`, `1`, `t`, `f`, `yes`, `no`, `y`, `n`, `on`, and `off` in Boolean columns.
     /// The textual aliases are matched case-insensitively.
     /// Disabled by default to preserve the strict CSV reader behavior.
@@ -1919,6 +1928,7 @@ impl ReaderBuilder {
             self.schema.fields().len(),
             self.format.truncated_rows,
         )
+        .with_ignore_extra_fields(self.ignore_extra_fields)
         .with_record_error_handler(self.record_error_handler)
         .with_replace_invalid_utf8(self.format.replace_invalid_utf8)
         .with_ignored_prefix_options(self.format.comment, self.format.terminator)
@@ -1977,6 +1987,144 @@ mod tests {
         fn handle_invalid_utf8(&self, _error: &CsvInvalidUtf8Error<'_>) -> Result<(), ArrowError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_ignore_extra_fields_keeps_strict_reader_default() {
+        let schema = Arc::new(Schema::new(vec![Field::new("first", DataType::Utf8, true)]));
+        let csv = b"\"a,b\",ignored\nsecond,\"x,y\"\nthird\n";
+        let error = ReaderBuilder::new(Arc::clone(&schema))
+            .build(Cursor::new(csv))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("incorrect number of fields"));
+
+        let input = std::io::BufReader::with_capacity(1, Cursor::new(csv));
+        let batches = ReaderBuilder::new(schema)
+            .with_ignore_extra_fields(true)
+            .build_buffered(input)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0].column(0).as_string::<i32>();
+        assert_eq!(batches[0].num_rows(), 3);
+        assert_eq!(values.value(0), "a,b");
+        assert_eq!(values.value(1), "second");
+        assert_eq!(values.value(2), "third");
+    }
+
+    #[test]
+    fn test_ignore_extra_fields_with_recovery_and_quoted_empty() {
+        let schema = Arc::new(Schema::new(vec![Field::new("first", DataType::Utf8, true)]));
+        let csv = b"\"\",ignored\nvalid,\xff\nafter\n";
+        let input = std::io::BufReader::with_capacity(1, Cursor::new(csv));
+        let batches = ReaderBuilder::new(schema)
+            .with_ignore_extra_fields(true)
+            .with_preserve_quoted_empty(true)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build_buffered(input)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let values = batches[0].column(0).as_string::<i32>();
+        assert_eq!(batches[0].num_rows(), 3);
+        assert!(!values.is_null(0));
+        assert_eq!(values.value(0), "");
+        assert_eq!(values.value(1), "valid");
+        assert_eq!(values.value(2), "after");
+    }
+
+    #[test]
+    fn test_ignore_extra_fields_across_batches_and_eof() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Utf8, true),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        let long_extra = "x".repeat(4_096);
+        let csv = format!("a,b,{long_extra},tail\nc,d\ne,f,{long_extra}");
+        let input = std::io::BufReader::with_capacity(7, Cursor::new(csv));
+        let batches = ReaderBuilder::new(schema)
+            .with_batch_size(1)
+            .with_truncated_rows(true)
+            .with_ignore_extra_fields(true)
+            .build_buffered(input)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 3);
+        let values = batches
+            .iter()
+            .map(|batch| {
+                (
+                    batch.column(0).as_string::<i32>().value(0).to_owned(),
+                    batch.column(1).as_string::<i32>().value(0).to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [("a", "b"), ("c", "d"), ("e", "f")]
+                .map(|(first, second)| (first.to_owned(), second.to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_ignore_extra_fields_preserves_missing_field_behavior() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Utf8, true),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        let csv = b"a,b,extra\nc\n";
+        let error = ReaderBuilder::new(Arc::clone(&schema))
+            .with_ignore_extra_fields(true)
+            .build(Cursor::new(csv))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_err();
+        assert!(error.to_string().contains("expected 2 got 1"));
+
+        let batches = ReaderBuilder::new(schema)
+            .with_truncated_rows(true)
+            .with_ignore_extra_fields(true)
+            .build(Cursor::new(csv))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 2);
+        assert!(batches[0].column(1).is_null(1));
+    }
+
+    #[test]
+    fn test_ignore_extra_fields_rejects_empty_schema() {
+        let schema = Arc::new(Schema::empty());
+        let strict_error = ReaderBuilder::new(Arc::clone(&schema))
+            .with_ignore_extra_fields(true)
+            .build(Cursor::new(b"a\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            strict_error
+                .to_string()
+                .contains("cannot ignore extra fields with an empty schema")
+        );
+
+        let recovery_error = ReaderBuilder::new(schema)
+            .with_ignore_extra_fields(true)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build(Cursor::new(b"a\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            recovery_error
+                .to_string()
+                .contains("cannot ignore extra fields with an empty schema")
+        );
     }
 
     #[test]

@@ -114,6 +114,7 @@ impl QuotedEmptyFields {
         row: usize,
         columns: usize,
         present_fields: usize,
+        ignore_extra_fields: bool,
         raw: &[u8],
     ) -> Result<(), ArrowError> {
         let start = row
@@ -169,10 +170,13 @@ impl QuotedEmptyFields {
                 || self.terminator.is_some_and(|term| byte == term)
                 || (self.terminator.is_none() && (byte == b'\n' || byte == b'\r'))
             {
-                let flag = flags.get_mut(field).ok_or_else(|| {
-                    ArrowError::CsvError("CSV quoted-field count exceeds schema".to_owned())
-                })?;
-                *flag = u8::from(raw[start..i] == [self.quote, self.quote]);
+                if let Some(flag) = flags.get_mut(field) {
+                    *flag = u8::from(raw[start..i] == [self.quote, self.quote]);
+                } else if !ignore_extra_fields {
+                    return Err(ArrowError::CsvError(
+                        "CSV quoted-field count exceeds schema".to_owned(),
+                    ));
+                }
                 field += 1;
                 start = i + 1;
                 if self.terminator.is_some_and(|term| byte == term)
@@ -185,10 +189,13 @@ impl QuotedEmptyFields {
             i += 1;
         }
         if !terminated {
-            let flag = flags.get_mut(field).ok_or_else(|| {
-                ArrowError::CsvError("CSV quoted-field count exceeds schema".to_owned())
-            })?;
-            *flag = u8::from(raw[start..] == [self.quote, self.quote]);
+            if let Some(flag) = flags.get_mut(field) {
+                *flag = u8::from(raw[start..] == [self.quote, self.quote]);
+            } else if !ignore_extra_fields {
+                return Err(ArrowError::CsvError(
+                    "CSV quoted-field count exceeds schema".to_owned(),
+                ));
+            }
             field += 1;
         }
         if field != present_fields {
@@ -257,6 +264,10 @@ pub struct RecordDecoder {
     /// When enabled fills in missing columns with null
     truncated_rows: bool,
 
+    /// Discard fields beyond the schema width on the opt-in path.
+    ignore_extra_fields: bool,
+    skipping_extra_fields: bool,
+
     /// Optional recovery hook. Keeping this `None` selects the allocation-free strict path.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
 
@@ -310,6 +321,8 @@ impl RecordDecoder {
             field_counts: truncated_rows.then(Vec::new),
             quoted_empty: None,
             truncated_rows,
+            ignore_extra_fields: false,
+            skipping_extra_fields: false,
             record_error_handler: None,
             filter_records: false,
             max_record_bytes: None,
@@ -331,6 +344,11 @@ impl RecordDecoder {
             record_data_start: 0,
             record_offsets_start: 1,
         }
+    }
+
+    pub fn with_ignore_extra_fields(mut self, ignore: bool) -> Self {
+        self.ignore_extra_fields = ignore;
+        self
     }
 
     pub fn with_record_error_handler(
@@ -395,7 +413,8 @@ impl RecordDecoder {
             Some(handler) => {
                 self.decode_with_record_error_handler(input, to_read, handler.as_ref())
             }
-            None => self.decode_strict(input, to_read),
+            None if self.ignore_extra_fields => self.decode_strict::<true>(input, to_read),
+            None => self.decode_strict::<false>(input, to_read),
         }
     }
 
@@ -414,7 +433,11 @@ impl RecordDecoder {
         &mut self,
         input: &[u8],
     ) -> Result<(usize, usize), ArrowError> {
-        let (rows, bytes) = self.decode_strict(input, 1)?;
+        let (rows, bytes) = if self.ignore_extra_fields {
+            self.decode_strict::<true>(input, 1)?
+        } else {
+            self.decode_strict::<false>(input, 1)?
+        };
         self.source_lines.advance(&input[..bytes]);
         self.stream_offset = self
             .stream_offset
@@ -442,13 +465,18 @@ impl RecordDecoder {
         (read, consumed)
     }
 
-    fn decode_strict(
+    fn decode_strict<const IGNORE_EXTRA: bool>(
         &mut self,
         input: &[u8],
         to_read: usize,
     ) -> Result<(usize, usize), ArrowError> {
         if to_read == 0 {
             return Ok((0, 0));
+        }
+        if IGNORE_EXTRA && self.num_columns == 0 {
+            return Err(ArrowError::CsvError(
+                "CSV cannot ignore extra fields with an empty schema".to_owned(),
+            ));
         }
 
         // Reserve sufficient capacity in offsets
@@ -471,17 +499,40 @@ impl RecordDecoder {
 
             // Try to read a record
             loop {
-                let (result, bytes_read, bytes_written, end_positions) =
+                let skipping_extra_fields = IGNORE_EXTRA && self.skipping_extra_fields;
+                let (result, bytes_read, bytes_written, end_positions) = if skipping_extra_fields {
+                    let mut skipped_data = [0_u8; 1024];
+                    let mut skipped_offsets = [0_usize; 16];
+                    self.delimiter.read_record(
+                        &input[input_offset..],
+                        &mut skipped_data,
+                        &mut skipped_offsets,
+                    )
+                } else {
+                    let offsets_end = if IGNORE_EXTRA {
+                        self.record_offsets_start + self.num_columns
+                    } else {
+                        self.offsets.len()
+                    };
                     self.delimiter.read_record(
                         &input[input_offset..],
                         &mut self.data[self.data_len..],
-                        &mut self.offsets[self.offsets_len..],
-                    );
+                        &mut self.offsets[self.offsets_len..offsets_end],
+                    )
+                };
 
                 self.current_field += end_positions;
-                self.offsets_len += end_positions;
                 input_offset += bytes_read;
-                self.data_len += bytes_written;
+                if skipping_extra_fields {
+                    if self.quoted_empty.is_some() {
+                        self.record_bytes
+                            .extend_from_slice(&input[record_start..input_offset]);
+                        record_start = input_offset;
+                    }
+                } else {
+                    self.offsets_len += end_positions;
+                    self.data_len += bytes_written;
+                }
 
                 match result {
                     ReadRecordResult::End | ReadRecordResult::InputEmpty => {
@@ -493,15 +544,38 @@ impl RecordDecoder {
                         return Ok((read, input_offset));
                     }
                     // Need to allocate more capacity
-                    ReadRecordResult::OutputFull => break,
+                    ReadRecordResult::OutputFull => {
+                        if skipping_extra_fields {
+                            continue;
+                        }
+                        break;
+                    }
                     ReadRecordResult::OutputEndsFull => {
+                        if skipping_extra_fields {
+                            continue;
+                        }
+                        if IGNORE_EXTRA {
+                            self.skipping_extra_fields = true;
+                            self.data_len = self.record_data_start
+                                + self.offsets[self.record_offsets_start + self.num_columns - 1];
+                            self.offsets_len = self.record_offsets_start + self.num_columns;
+                            if self.quoted_empty.is_some() {
+                                self.record_bytes
+                                    .extend_from_slice(&input[record_start..input_offset]);
+                                record_start = input_offset;
+                            }
+                            continue;
+                        }
                         return Err(ArrowError::CsvError(format!(
                             "incorrect number of fields for line {}, expected {} got more than {}",
                             self.line_number, self.num_columns, self.current_field
                         )));
                     }
                     ReadRecordResult::Record => {
-                        if self.current_field != self.num_columns {
+                        self.skipping_extra_fields = false;
+                        if self.current_field != self.num_columns
+                            && !(IGNORE_EXTRA && self.current_field > self.num_columns)
+                        {
                             if self.truncated_rows && self.current_field < self.num_columns {
                                 // If the number of fields is less than expected, pad with nulls
                                 let fill_count = self.num_columns - self.current_field;
@@ -516,6 +590,11 @@ impl RecordDecoder {
                                 )));
                             }
                         }
+                        if IGNORE_EXTRA && self.current_field > self.num_columns {
+                            self.data_len = self.record_data_start
+                                + self.offsets[self.record_offsets_start + self.num_columns - 1];
+                            self.offsets_len = self.record_offsets_start + self.num_columns;
+                        }
                         if let Some(counts) = &mut self.field_counts {
                             if counts.len() == self.num_rows {
                                 counts.push(self.current_field);
@@ -529,6 +608,7 @@ impl RecordDecoder {
                                     self.num_rows,
                                     self.num_columns,
                                     self.current_field,
+                                    IGNORE_EXTRA,
                                     &input[record_start..input_offset],
                                 )?;
                             } else {
@@ -538,6 +618,7 @@ impl RecordDecoder {
                                     self.num_rows,
                                     self.num_columns,
                                     self.current_field,
+                                    IGNORE_EXTRA,
                                     &self.record_bytes,
                                 )?;
                                 self.record_bytes.clear();
@@ -548,6 +629,10 @@ impl RecordDecoder {
                         self.current_field = 0;
                         self.line_number += 1;
                         self.num_rows += 1;
+                        if IGNORE_EXTRA {
+                            self.record_data_start = self.data_len;
+                            self.record_offsets_start = self.offsets_len;
+                        }
 
                         if read == to_read {
                             // Read sufficient rows
@@ -575,6 +660,11 @@ impl RecordDecoder {
         if to_read == 0 {
             return Ok((0, 0));
         }
+        if self.ignore_extra_fields && self.num_columns == 0 {
+            return Err(ArrowError::CsvError(
+                "CSV cannot ignore extra fields with an empty schema".to_owned(),
+            ));
+        }
 
         // The reader can pass the same unread tail again after a full batch. Bound
         // preflight work per requested row so small batches do not rescan that tail.
@@ -601,6 +691,7 @@ impl RecordDecoder {
             self.data.resize(self.data_len + estimated_data, 0);
 
             loop {
+                let skipping_extra_fields = self.ignore_extra_fields && self.skipping_extra_fields;
                 let max_offsets_len = self
                     .record_offsets_start
                     .checked_add(self.num_columns)
@@ -608,21 +699,36 @@ impl RecordDecoder {
                     .ok_or_else(|| {
                         ArrowError::CsvError("CSV field offset capacity overflowed".into())
                     })?;
-                let offsets_end = self.offsets.len().min(max_offsets_len);
+                let offsets_end = if self.ignore_extra_fields {
+                    self.record_offsets_start + self.num_columns
+                } else {
+                    self.offsets.len().min(max_offsets_len)
+                };
                 let record_input_start = input_offset;
                 let bom_stripped = self.stream_offset == 0
                     && input[record_input_start..].starts_with(b"\xef\xbb\xbf");
-                let (result, bytes_read, bytes_written, end_positions) =
+                let (result, bytes_read, bytes_written, end_positions) = if skipping_extra_fields {
+                    let mut skipped_data = [0_u8; 1024];
+                    let mut skipped_offsets = [0_usize; 16];
+                    self.delimiter.read_record(
+                        &input[input_offset..],
+                        &mut skipped_data,
+                        &mut skipped_offsets,
+                    )
+                } else {
                     self.delimiter.read_record(
                         &input[input_offset..],
                         &mut self.data[self.data_len..],
                         &mut self.offsets[self.offsets_len..offsets_end],
-                    );
+                    )
+                };
 
                 self.current_field += end_positions;
-                self.offsets_len += end_positions;
+                if !skipping_extra_fields {
+                    self.offsets_len += end_positions;
+                    self.data_len += bytes_written;
+                }
                 input_offset += bytes_read;
-                self.data_len += bytes_written;
                 self.stream_offset =
                     self.stream_offset.checked_add(bytes_read).ok_or_else(|| {
                         ArrowError::CsvError("CSV input byte offset overflowed".into())
@@ -655,8 +761,23 @@ impl RecordDecoder {
                             read,
                         ));
                     }
-                    ReadRecordResult::OutputFull => break,
+                    ReadRecordResult::OutputFull => {
+                        if skipping_extra_fields {
+                            continue;
+                        }
+                        break;
+                    }
                     ReadRecordResult::OutputEndsFull => {
+                        if skipping_extra_fields {
+                            continue;
+                        }
+                        if self.ignore_extra_fields {
+                            self.skipping_extra_fields = true;
+                            self.data_len = self.record_data_start
+                                + self.offsets[self.record_offsets_start + self.num_columns - 1];
+                            self.offsets_len = self.record_offsets_start + self.num_columns;
+                            continue;
+                        }
                         if self.offsets_len >= max_offsets_len {
                             return Err(recovery_limit_error(self.line_number));
                         }
@@ -670,6 +791,7 @@ impl RecordDecoder {
                         self.offsets.resize(new_len, 0);
                     }
                     ReadRecordResult::Record => {
+                        self.skipping_extra_fields = false;
                         let ignored_bytes = ignored_record_prefix(
                             &self.record_bytes,
                             self.comment,
@@ -714,6 +836,7 @@ impl RecordDecoder {
                         }
                         if self.current_field != self.num_columns
                             && !(self.truncated_rows && self.current_field < self.num_columns)
+                            && !(self.ignore_extra_fields && self.current_field > self.num_columns)
                         {
                             handler.handle(&CsvRecordError {
                                 line_number: self.line_number,
@@ -725,6 +848,12 @@ impl RecordDecoder {
                             self.skip_current_record();
                             self.record_needs_utf8_validation = input_requires_utf8_validation;
                             continue;
+                        }
+
+                        if self.ignore_extra_fields && self.current_field > self.num_columns {
+                            self.data_len = self.record_data_start
+                                + self.offsets[self.record_offsets_start + self.num_columns - 1];
+                            self.offsets_len = self.record_offsets_start + self.num_columns;
                         }
 
                         let row_data = &self.data[self.record_data_start..self.data_len];
@@ -791,6 +920,7 @@ impl RecordDecoder {
                                 self.num_rows,
                                 self.num_columns,
                                 self.current_field,
+                                self.ignore_extra_fields,
                                 &self.record_bytes,
                             )?;
                         }
@@ -829,6 +959,7 @@ impl RecordDecoder {
     }
 
     fn skip_current_record(&mut self) {
+        self.skipping_extra_fields = false;
         self.data_len = self.record_data_start;
         self.offsets_len = self.record_offsets_start;
         self.current_field = 0;
@@ -1282,6 +1413,42 @@ mod tests {
             });
         }
         assert!(expected.next().is_none());
+    }
+
+    #[test]
+    fn test_ignore_large_extra_field_without_decoding_it() {
+        let long_extra = "x".repeat(1_000_000);
+        let csv = format!("kept,{long_extra}\nnext,extra\n");
+        let mut decoder =
+            RecordDecoder::new(Reader::new(), 1, false).with_ignore_extra_fields(true);
+        let (rows, bytes) = decoder.decode(csv.as_bytes(), 1024).unwrap();
+        assert_eq!((rows, bytes), (2, csv.len()));
+        assert_eq!(decoder.data_len, "keptnext".len());
+        assert!(decoder.data.len() < 64 * 1024);
+        let records = decoder.flush().unwrap();
+        assert_eq!(
+            records.iter().map(|row| row.get(0)).collect::<Vec<_>>(),
+            ["kept", "next"]
+        );
+    }
+
+    #[test]
+    fn test_ignore_more_than_recovery_limit_extra_fields() {
+        let csv = format!(
+            "kept{}\n",
+            ",ignored".repeat(MAX_RECOVERABLE_EXCESS_FIELDS + 1)
+        );
+        let handler = Arc::new(CollectRecords::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 1, false)
+            .with_ignore_extra_fields(true)
+            .with_record_error_handler(Some(handler.clone()));
+        let (rows, bytes) = decoder.decode(csv.as_bytes(), 1024).unwrap();
+        assert_eq!((rows, bytes), (1, csv.len()));
+        assert_eq!(decoder.data_len, "kept".len());
+        let records = decoder.flush().unwrap();
+        assert_eq!(records.get(0).get(0), "kept");
+        assert!(handler.errors.lock().unwrap().is_empty());
+        assert_eq!(handler.records.lock().unwrap().len(), 1);
     }
 
     #[test]
