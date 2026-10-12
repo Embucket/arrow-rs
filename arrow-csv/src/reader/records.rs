@@ -473,6 +473,11 @@ impl RecordDecoder {
         if to_read == 0 {
             return Ok((0, 0));
         }
+        if IGNORE_EXTRA && self.num_columns == 0 {
+            return Err(ArrowError::CsvError(
+                "CSV cannot ignore extra fields with an empty schema".to_owned(),
+            ));
+        }
 
         // Reserve sufficient capacity in offsets
         self.offsets
@@ -654,6 +659,11 @@ impl RecordDecoder {
     ) -> Result<(usize, usize), ArrowError> {
         if to_read == 0 {
             return Ok((0, 0));
+        }
+        if self.ignore_extra_fields && self.num_columns == 0 {
+            return Err(ArrowError::CsvError(
+                "CSV cannot ignore extra fields with an empty schema".to_owned(),
+            ));
         }
 
         // The reader can pass the same unread tail again after a full batch. Bound

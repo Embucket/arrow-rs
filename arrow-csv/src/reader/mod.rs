@@ -2097,6 +2097,37 @@ mod tests {
     }
 
     #[test]
+    fn test_ignore_extra_fields_rejects_empty_schema() {
+        let schema = Arc::new(Schema::empty());
+        let strict_error = ReaderBuilder::new(Arc::clone(&schema))
+            .with_ignore_extra_fields(true)
+            .build(Cursor::new(b"a\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            strict_error
+                .to_string()
+                .contains("cannot ignore extra fields with an empty schema")
+        );
+
+        let recovery_error = ReaderBuilder::new(schema)
+            .with_ignore_extra_fields(true)
+            .with_record_error_handler(Arc::new(SkipMalformed))
+            .build(Cursor::new(b"a\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            recovery_error
+                .to_string()
+                .contains("cannot ignore extra fields with an empty schema")
+        );
+    }
+
+    #[test]
     fn test_invalid_utf8_skipped_header_preserves_first_data_row() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
