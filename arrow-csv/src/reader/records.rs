@@ -838,8 +838,14 @@ impl RecordDecoder {
                             && !(self.truncated_rows && self.current_field < self.num_columns)
                             && !(self.ignore_extra_fields && self.current_field > self.num_columns)
                         {
+                            source_lines.advance(&input[counted_until..input_offset]);
+                            counted_until = input_offset;
                             handler.handle(&CsvRecordError {
                                 line_number: self.line_number,
+                                source_line_number: source_lines.record_start_line(
+                                    usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
+                                    &self.record_bytes,
+                                ),
                                 byte_offset: self.record_byte_offset,
                                 expected_fields: self.num_columns,
                                 actual_fields: self.current_field,
@@ -1210,6 +1216,7 @@ mod tests {
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct OwnedRecordError {
         line_number: usize,
+        source_line_number: usize,
         byte_offset: usize,
         expected_fields: usize,
         actual_fields: usize,
@@ -1243,6 +1250,7 @@ mod tests {
         fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
             self.errors.lock().unwrap().push(OwnedRecordError {
                 line_number: error.line_number,
+                source_line_number: error.source_line_number,
                 byte_offset: error.byte_offset,
                 expected_fields: error.expected_fields,
                 actual_fields: error.actual_fields,
@@ -1508,6 +1516,7 @@ mod tests {
             [
                 OwnedRecordError {
                     line_number: 2,
+                    source_line_number: 2,
                     byte_offset: 5,
                     expected_fields: 2,
                     actual_fields: 3,
@@ -1515,6 +1524,7 @@ mod tests {
                 },
                 OwnedRecordError {
                     line_number: 3,
+                    source_line_number: 3,
                     byte_offset: 19,
                     expected_fields: 2,
                     actual_fields: 1,
@@ -1540,6 +1550,32 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_record_error_reports_physical_line_after_ignored_input() {
+        for (csv, expected_line) in [
+            (b"1,ok\n\n2,extra,value\n".as_slice(), 3),
+            (
+                b"\"header\ncontinued\",value\n2,extra,value\n".as_slice(),
+                3,
+            ),
+        ] {
+            let handler = Arc::new(CollectRecords::default());
+            let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                .with_record_error_handler(Some(handler.clone()));
+            let (read, consumed) = decoder.decode(csv, 1).expect("first record");
+            assert_eq!(read, 1);
+            decoder.clear();
+            decoder
+                .decode(&csv[consumed..], 1)
+                .expect("recover malformed record");
+
+            let errors = handler.errors.lock().unwrap();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].line_number, 2);
+            assert_eq!(errors[0].source_line_number, expected_line);
+        }
     }
 
     #[test]

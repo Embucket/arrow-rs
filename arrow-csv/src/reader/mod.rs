@@ -188,6 +188,8 @@ use arrow_array::timezone::Tz;
 pub struct CsvRecordError<'a> {
     /// One-based record number, including any header row.
     pub line_number: usize,
+    /// One-based physical line containing the start of the malformed record.
+    pub source_line_number: usize,
     /// Zero-based byte offset of the start of the record in the input stream.
     pub byte_offset: usize,
     /// Number of fields required by the reader schema.
