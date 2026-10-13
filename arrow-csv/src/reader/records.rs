@@ -35,10 +35,18 @@ struct QuotedEmptyFields {
     fields: Vec<u8>,
 }
 
+fn is_record_terminator(byte: u8, terminator: Option<u8>) -> bool {
+    terminator.map_or(byte == b'\n' || byte == b'\r', |term| byte == term)
+}
+
+fn is_comment_start(byte: u8, comment: Option<u8>, terminator: Option<u8>) -> bool {
+    Some(byte) == comment && !is_record_terminator(byte, terminator)
+}
+
 fn ignored_record_prefix(raw: &[u8], comment: Option<u8>, terminator: Option<u8>) -> usize {
     let mut offset = 0;
     while let Some(&byte) = raw.get(offset) {
-        if Some(byte) == comment && Some(byte) != terminator {
+        if is_comment_start(byte, comment, terminator) {
             let Some(end) = raw[offset..].iter().position(|byte| *byte == b'\n') else {
                 break;
             };
@@ -146,16 +154,12 @@ impl QuotedEmptyFields {
         let mut i = 0;
         while i < raw.len() {
             let byte = raw[i];
-            if field == 0
-                && i == start
-                && (self.terminator.is_some_and(|term| byte == term)
-                    || (self.terminator.is_none() && (byte == b'\n' || byte == b'\r')))
-            {
+            if field == 0 && i == start && is_record_terminator(byte, self.terminator) {
                 i += 1;
                 start = i;
                 continue;
             }
-            if field == 0 && i == start && Some(byte) == self.comment {
+            if field == 0 && i == start && is_comment_start(byte, self.comment, self.terminator) {
                 while i < raw.len() && raw[i] != b'\n' {
                     i += 1;
                 }
@@ -485,7 +489,9 @@ impl RecordDecoder {
     ) -> Result<(usize, usize), ArrowError> {
         if self.blank_records_are_rows
             && self.terminator.is_some()
-            && self.comment != self.terminator
+            && self
+                .comment
+                .is_some_and(|byte| is_comment_start(byte, self.comment, self.terminator))
             && (self.skipping_custom_comment || input.first().copied() == self.comment)
         {
             let mut input_offset = 0;
@@ -535,9 +541,11 @@ impl RecordDecoder {
     }
 
     fn header_starts_with_blank(&self, input: &[u8]) -> bool {
-        if self.current_field != 0
-            || (!self.record_bytes.is_empty() && self.record_bytes.first().copied() != self.comment)
-        {
+        let pending_comment = self
+            .record_bytes
+            .first()
+            .is_some_and(|byte| is_comment_start(*byte, self.comment, self.terminator));
+        if self.current_field != 0 || (!self.record_bytes.is_empty() && !pending_comment) {
             return false;
         }
         let mut remaining = if self.stream_offset == 0 {
@@ -545,15 +553,11 @@ impl RecordDecoder {
         } else {
             input
         };
-        if self.comment.is_some()
-            && self.comment != self.terminator
-            && self.record_bytes.first().copied() == self.comment
-            && let Some(end) = memchr::memchr(b'\n', remaining)
-        {
+        if pending_comment && let Some(end) = memchr::memchr(b'\n', remaining) {
             remaining = &remaining[end + 1..];
         }
         while let Some(comment) = self.comment
-            && Some(comment) != self.terminator
+            && is_comment_start(comment, self.comment, self.terminator)
             && remaining.first() == Some(&comment)
         {
             let Some(end) = memchr::memchr(b'\n', remaining) else {
@@ -561,12 +565,9 @@ impl RecordDecoder {
             };
             remaining = &remaining[end + 1..];
         }
-        self.terminator.map_or(
-            remaining
-                .first()
-                .is_some_and(|byte| *byte == b'\n' || *byte == b'\r'),
-            |term| remaining.first() == Some(&term),
-        )
+        remaining
+            .first()
+            .is_some_and(|byte| is_record_terminator(*byte, self.terminator))
     }
 
     fn complete_recovery(
@@ -646,7 +647,7 @@ impl RecordDecoder {
                     continue;
                 }
             }
-            if Some(raw[offset]) == self.comment && Some(raw[offset]) != self.terminator {
+            if is_comment_start(raw[offset], self.comment, self.terminator) {
                 let newline = raw[offset..]
                     .iter()
                     .position(|byte| *byte == b'\n')
@@ -701,18 +702,14 @@ impl RecordDecoder {
         let Some(&byte) = input.get(*input_offset) else {
             return Ok(false);
         };
-        let is_terminator = self
-            .terminator
-            .map_or(byte == b'\n' || byte == b'\r', |term| byte == term);
+        let is_terminator = is_record_terminator(byte, self.terminator);
         if !is_terminator {
             self.pending_cr = None;
             return Ok(false);
         }
         let continuation = matches!(self.pending_cr, Some(PendingCr::Data)) && byte == b'\n';
         self.pending_cr = None;
-        if (Some(byte) == self.comment && Some(byte) != self.terminator)
-            || (self.stream_offset == 0 && input[*input_offset..].starts_with(b"\xef\xbb\xbf"))
-        {
+        if self.stream_offset == 0 && input[*input_offset..].starts_with(b"\xef\xbb\xbf") {
             return Ok(false);
         }
 
@@ -815,7 +812,7 @@ impl RecordDecoder {
         let Some(comment) = self.comment else {
             return Ok(false);
         };
-        if self.terminator.is_none() || self.terminator == Some(comment) {
+        if self.terminator.is_none() || !is_comment_start(comment, self.comment, self.terminator) {
             return Ok(false);
         }
         if !self.skipping_custom_comment {
@@ -869,19 +866,17 @@ impl RecordDecoder {
             return true;
         }
         if let Some(comment) = self.comment
-            && Some(comment) != self.terminator
+            && is_comment_start(comment, self.comment, self.terminator)
             && (memchr::memchr(comment, input).is_some()
                 || self.record_bytes.first() == Some(&comment))
         {
             return true;
         }
         let after_bom = input.strip_prefix(b"\xef\xbb\xbf").unwrap_or(input);
-        if self.terminator.map_or(
-            after_bom
-                .first()
-                .is_some_and(|byte| *byte == b'\n' || *byte == b'\r'),
-            |term| after_bom.first() == Some(&term),
-        ) {
+        if after_bom
+            .first()
+            .is_some_and(|byte| is_record_terminator(*byte, self.terminator))
+        {
             return true;
         }
         if let Some(term) = self.terminator {
@@ -1180,10 +1175,12 @@ impl RecordDecoder {
                     &remaining_input[..1]
                 } else if BLANK_AS_ROW
                     && self.current_field == 0
-                    && self.comment.is_some()
-                    && self.comment != self.terminator
-                    && (remaining_input.first().copied() == self.comment
-                        || self.record_bytes.first().copied() == self.comment)
+                    && (remaining_input
+                        .first()
+                        .is_some_and(|byte| is_comment_start(*byte, self.comment, self.terminator))
+                        || self.record_bytes.first().is_some_and(|byte| {
+                            is_comment_start(*byte, self.comment, self.terminator)
+                        }))
                 {
                     let comment_end = memchr::memchr(b'\n', remaining_input)
                         .map_or(remaining_input.len(), |position| position + 1);
@@ -2156,6 +2153,47 @@ mod tests {
                     ["a", "", "b"]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_default_terminator_takes_precedence_over_comment() {
+        for (comment, csv, header) in [
+            (b'\n', b"a\n\nb\n".as_slice(), b"\nvalue\n".as_slice()),
+            (b'\r', b"a\r\rb\r".as_slice(), b"\rvalue\r".as_slice()),
+        ] {
+            let handler = Arc::new(CollectRecords {
+                materialize_blanks: true,
+                ..Default::default()
+            });
+            let mut builder = csv_core::ReaderBuilder::new();
+            builder.comment(Some(comment));
+            let mut decoder = RecordDecoder::new(builder.build(), 1, false)
+                .with_ignored_prefix_options(Some(comment), None)
+                .with_record_error_handler(Some(handler));
+            let (rows, bytes) = decoder.decode(csv, 3).unwrap();
+            assert_eq!((rows, bytes), (3, csv.len()));
+            assert_eq!(
+                decoder
+                    .flush()
+                    .unwrap()
+                    .iter()
+                    .map(|record| record.get(0))
+                    .collect::<Vec<_>>(),
+                ["a", "", "b"]
+            );
+
+            let handler = Arc::new(CollectRecords {
+                materialize_blanks: true,
+                ..Default::default()
+            });
+            let mut builder = csv_core::ReaderBuilder::new();
+            builder.comment(Some(comment));
+            let mut decoder = RecordDecoder::new(builder.build(), 1, false)
+                .with_ignored_prefix_options(Some(comment), None)
+                .with_record_error_handler(Some(handler));
+            assert_eq!(decoder.decode_validating_header(header).unwrap(), (1, 1));
+            assert_eq!(decoder.flush().unwrap().get(0).get(0), "");
         }
     }
 
