@@ -1655,6 +1655,17 @@ mod tests {
     }
 
     #[test]
+    fn test_successful_record_source_line_after_blank_line() {
+        let csv = b"1,ok\n\nbad,ok\n";
+        let handler = Arc::new(SourceLines::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_record_error_handler(Some(handler.clone()));
+        let (rows, bytes) = decoder.decode(csv, 2).unwrap();
+        assert_eq!((rows, bytes), (2, csv.len()));
+        assert_eq!(*handler.0.lock().unwrap(), [(1, 1, 0), (2, 3, 6)]);
+    }
+
+    #[test]
     fn test_successful_record_source_lines_split_crlf_custom_terminator() {
         let csv = b"1,a\r\nb|2,ok|";
         let mut builder = csv_core::ReaderBuilder::new();
@@ -2080,19 +2091,25 @@ mod tests {
     #[test]
     #[ignore = "local CSV record-handler throughput benchmark"]
     fn bench_valid_csv_with_record_handler() {
-        bench_valid_csv_row(b"1,ok\n");
+        bench_valid_csv_row(b"1,ok\n", false);
+    }
+
+    #[test]
+    #[ignore = "local CSV source-line callback throughput benchmark"]
+    fn bench_valid_csv_with_source_line_handler() {
+        bench_valid_csv_row(b"1,ok\n", true);
     }
 
     #[test]
     #[ignore = "local CSV record-handler throughput benchmark"]
     fn bench_valid_unicode_csv_with_record_handler() {
-        bench_valid_csv_row("1,é\n".as_bytes());
+        bench_valid_csv_row("1,é\n".as_bytes(), false);
     }
 
     #[test]
     #[ignore = "local CSV record-handler throughput benchmark"]
     fn bench_valid_quoted_csv_with_record_handler() {
-        bench_valid_csv_row(b"1,\"ok\"\n");
+        bench_valid_csv_row(b"1,\"ok\"\n", false);
     }
 
     #[test]
@@ -2136,19 +2153,34 @@ mod tests {
         println!("CSV quoted record filter times: {elapsed:?}");
     }
 
-    fn bench_valid_csv_row(row: &[u8]) {
+    fn bench_valid_csv_row(row: &[u8], source_lines: bool) {
         #[derive(Debug)]
-        struct Noop;
+        struct Noop {
+            source_lines: bool,
+        }
 
         impl CsvRecordErrorHandler for Noop {
             fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn needs_source_line_number(&self) -> bool {
+                self.source_lines
+            }
+
+            fn handle_record_with_source_line(
+                &self,
+                _record: &CsvRecord<'_>,
+                source_line_number: usize,
+            ) -> Result<(), ArrowError> {
+                std::hint::black_box(source_line_number);
                 Ok(())
             }
         }
 
         const ROWS: usize = 100_000;
         let csv = row.repeat(ROWS);
-        let handler = Arc::new(Noop);
+        let handler = Arc::new(Noop { source_lines });
         let mut elapsed = Vec::new();
         for _ in 0..6 {
             let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
@@ -2163,7 +2195,7 @@ mod tests {
             assert_eq!(records.len(), ROWS);
             elapsed.push(started.elapsed());
         }
-        println!("CSV record handler times: {elapsed:?}");
+        println!("CSV record handler (source_lines={source_lines}) times: {elapsed:?}");
     }
 
     #[test]
