@@ -442,15 +442,14 @@ impl RecordDecoder {
     ///
     /// Note: this expects to be called with an empty `input` to signal EOF
     pub fn decode(&mut self, input: &[u8], to_read: usize) -> Result<(usize, usize), ArrowError> {
-        if self.blank_records_are_rows && self.num_columns != 1 {
+        if self.blank_records_are_rows && self.num_columns == 0 {
             return Err(ArrowError::CsvError(
-                "CSV blank records can be rows only with a one-column schema".to_owned(),
+                "CSV blank records as rows require at least one column".to_owned(),
             ));
         }
         match self.record_error_handler.clone() {
             Some(handler)
-                if self.blank_records_are_rows
-                    && self.input_may_have_one_column_blank(input, to_read) =>
+                if self.blank_records_are_rows && self.input_may_have_blank(input, to_read) =>
             {
                 self.decode_with_record_error_handler::<true, true>(
                     input,
@@ -687,7 +686,7 @@ impl RecordDecoder {
     }
 
     #[inline(always)]
-    fn consume_one_column_blank_prefix(
+    fn consume_blank_prefix(
         &mut self,
         input: &[u8],
         input_offset: &mut usize,
@@ -767,17 +766,17 @@ impl RecordDecoder {
                     byte_offset: self.stream_offset,
                     record: raw,
                 })?;
-                self.offsets[self.offsets_len] = 0;
-                self.offsets_len += 1;
+                self.offsets[self.offsets_len..self.offsets_len + self.num_columns].fill(0);
+                self.offsets_len += self.num_columns;
                 if let Some(counts) = &mut self.field_counts {
                     if counts.len() == self.num_rows {
-                        counts.push(1);
+                        counts.push(self.num_columns);
                     } else {
-                        counts[self.num_rows] = 1;
+                        counts[self.num_rows] = self.num_columns;
                     }
                 }
                 if let Some(quoted) = &mut self.quoted_empty {
-                    quoted.record(self.num_rows, 1, 1, false, raw)?;
+                    quoted.record(self.num_rows, self.num_columns, 1, false, raw)?;
                 }
                 self.num_rows += 1;
             }
@@ -857,7 +856,7 @@ impl RecordDecoder {
         Ok(true)
     }
 
-    fn input_may_have_one_column_blank(&self, input: &[u8], to_read: usize) -> bool {
+    fn input_may_have_blank(&self, input: &[u8], to_read: usize) -> bool {
         const MAX_PREFLIGHT_BYTES_PER_ROW: usize = 64;
         if self.skipping_custom_comment {
             return true;
@@ -1087,9 +1086,9 @@ impl RecordDecoder {
                 "CSV cannot ignore extra fields with an empty schema".to_owned(),
             ));
         }
-        if BLANK_AS_ROW && self.num_columns != 1 {
+        if BLANK_AS_ROW && self.num_columns == 0 {
             return Err(ArrowError::CsvError(
-                "CSV blank records can be rows only with a one-column schema".to_owned(),
+                "CSV blank records as rows require at least one column".to_owned(),
             ));
         }
 
@@ -1129,7 +1128,7 @@ impl RecordDecoder {
                     continue;
                 }
                 if BLANK_AS_ROW
-                    && self.consume_one_column_blank_prefix(
+                    && self.consume_blank_prefix(
                         input,
                         &mut input_offset,
                         &mut counted_until,
@@ -2085,15 +2084,57 @@ mod tests {
     }
 
     #[test]
-    fn test_blank_records_as_rows_requires_one_column() {
+    fn test_blank_records_as_rows_with_multiple_columns() {
+        for csv in [b"1,2\n\n3,4\n".as_slice(), b"1,2\r\n\r\n3,4\r\n".as_slice()] {
+            for capacity in [1, 2, 5, 64] {
+                for batch_size in [1, 2, 8] {
+                    let handler = Arc::new(CollectRecords {
+                        materialize_blanks: true,
+                        ..Default::default()
+                    });
+                    let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                        .with_record_error_handler(Some(handler.clone()));
+                    let mut reader = BufReader::with_capacity(capacity, Cursor::new(csv));
+                    let mut actual = Vec::new();
+                    loop {
+                        let buf = reader.fill_buf().unwrap();
+                        let (_, bytes) = decoder.decode(buf, batch_size - decoder.len()).unwrap();
+                        reader.consume(bytes);
+                        if decoder.len() == batch_size || bytes == 0 {
+                            actual.extend(decoder.flush().unwrap().iter().map(|record| {
+                                (record.get(0).to_owned(), record.get(1).to_owned())
+                            }));
+                        }
+                        if bytes == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        actual,
+                        [
+                            ("1".into(), "2".into()),
+                            ("".into(), "".into()),
+                            ("3".into(), "4".into())
+                        ],
+                        "capacity={capacity}, batch={batch_size}"
+                    );
+                    assert!(handler.blanks.lock().unwrap().is_empty());
+                    assert!(handler.errors.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_blank_records_as_rows_requires_nonempty_schema() {
         let handler = Arc::new(CollectRecords {
             materialize_blanks: true,
             ..Default::default()
         });
         let mut decoder =
-            RecordDecoder::new(Reader::new(), 2, false).with_record_error_handler(Some(handler));
+            RecordDecoder::new(Reader::new(), 0, false).with_record_error_handler(Some(handler));
         let error = decoder.decode(b"\n", 1).unwrap_err();
-        assert!(error.to_string().contains("one-column schema"));
+        assert!(error.to_string().contains("at least one column"));
     }
 
     #[test]
@@ -3584,6 +3625,45 @@ mod tests {
                 elapsed.push(started.elapsed());
             }
             println!("CSV one-column materialize={materialize}: {elapsed:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "focused performance check for opt-in multi-column CSV recovery"]
+    fn bench_multicolumn_blank_as_rows_fast_path() {
+        #[derive(Debug)]
+        struct Noop {
+            materialize: bool,
+        }
+
+        impl CsvRecordErrorHandler for Noop {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                self.materialize
+            }
+        }
+
+        const ROWS: usize = 100_000;
+        let csv = b"1,value\n".repeat(ROWS);
+        for materialize in [false, true] {
+            let handler = Arc::new(Noop { materialize });
+            let mut elapsed = Vec::new();
+            for _ in 0..8 {
+                let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                    .with_utf8_preserving_syntax(true)
+                    .with_record_error_handler(Some(handler.clone()));
+                let started = Instant::now();
+                let (rows, bytes) = decoder.decode(&csv, ROWS).unwrap();
+                let records = decoder.flush().unwrap();
+                assert_eq!(rows, ROWS);
+                assert_eq!(bytes, csv.len());
+                assert_eq!(records.len(), ROWS);
+                elapsed.push(started.elapsed());
+            }
+            println!("CSV multi-column materialize={materialize}: {elapsed:?}");
         }
     }
 
