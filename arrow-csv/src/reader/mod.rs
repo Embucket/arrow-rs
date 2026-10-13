@@ -303,9 +303,8 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
         false
     }
 
-    /// Opt in to treating physical blank lines as empty one-column records.
-    /// This is supported only for a single-column schema. The default reader
-    /// still skips blank lines.
+    /// Opt in to treating physical blank lines as records with empty fields.
+    /// This requires a nonempty schema. The default reader still skips blank lines.
     fn blank_records_are_rows(&self) -> bool {
         false
     }
@@ -2119,6 +2118,76 @@ mod tests {
         fn handle_invalid_utf8(&self, _error: &CsvInvalidUtf8Error<'_>) -> Result<(), ArrowError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_multicolumn_blank_record_materializes_null_fields() {
+        #[derive(Debug)]
+        struct BlankRows;
+
+        impl CsvRecordErrorHandler for BlankRows {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                true
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = ReaderBuilder::new(schema)
+            .with_record_error_handler(Arc::new(BlankRows))
+            .build(Cursor::new(b"1,a\n\n2,b\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert!(batch.column(0).is_null(1));
+        assert!(batch.column(1).is_null(1));
+    }
+
+    #[test]
+    fn test_multicolumn_blank_record_preserves_quoted_empty_across_crlf_chunks() {
+        #[derive(Debug)]
+        struct BlankRows;
+
+        impl CsvRecordErrorHandler for BlankRows {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                true
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Utf8, true),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        let input = std::io::BufReader::with_capacity(1, Cursor::new(b"\"\",x\r\n\r\nz,\"\"\r\n"));
+        let batch = ReaderBuilder::new(schema)
+            .with_preserve_quoted_empty(true)
+            .with_record_error_handler(Arc::new(BlankRows))
+            .build_buffered(input)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        let first = batch.column(0).as_string::<i32>();
+        let second = batch.column(1).as_string::<i32>();
+        assert!(!first.is_null(0));
+        assert_eq!(first.value(0), "");
+        assert!(first.is_null(1));
+        assert!(second.is_null(1));
+        assert!(!second.is_null(2));
+        assert_eq!(second.value(2), "");
     }
 
     #[test]
