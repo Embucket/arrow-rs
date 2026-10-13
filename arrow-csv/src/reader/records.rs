@@ -46,6 +46,63 @@ fn is_comment_start(byte: u8, comment: Option<u8>, terminator: Option<u8>) -> bo
     Some(byte) == comment && !is_record_terminator(byte, terminator)
 }
 
+#[cfg(target_arch = "x86_64")]
+fn scan_record_terminators(input: &[u8]) -> (bool, bool) {
+    use std::arch::x86_64::{
+        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+    };
+
+    // SSE2 is part of the x86-64 baseline. Compare 16 bytes at once and
+    // exclude CRLF, which is one record delimiter rather than two.
+    let (cr_byte, lf_byte) = unsafe { (_mm_set1_epi8(b'\r' as i8), _mm_set1_epi8(b'\n' as i8)) };
+    let mut offset = 0;
+    let mut previous = None;
+    let mut bare_cr = false;
+    while input.len() - offset >= 16 {
+        let (cr, lf) = unsafe {
+            let word = _mm_loadu_si128(input.as_ptr().add(offset).cast::<__m128i>());
+            (
+                _mm_movemask_epi8(_mm_cmpeq_epi8(word, cr_byte)) as u32,
+                _mm_movemask_epi8(_mm_cmpeq_epi8(word, lf_byte)) as u32,
+            )
+        };
+        let terminators = cr | lf;
+        bare_cr |= cr & 0x7fff & !(lf >> 1) != 0;
+        bare_cr |= previous == Some(b'\r') && lf & 1 == 0;
+        if (terminators & (terminators << 1) & !((cr << 1) & lf)) != 0 {
+            return (true, bare_cr);
+        }
+        if previous.is_some_and(|last| terminators & 1 != 0 && !(last == b'\r' && lf & 1 != 0)) {
+            return (true, bare_cr);
+        }
+        previous = is_record_terminator(input[offset + 15], None).then_some(input[offset + 15]);
+        offset += 16;
+    }
+    for &byte in &input[offset..] {
+        bare_cr |= previous == Some(b'\r') && byte != b'\n';
+        if previous.is_some_and(|last| {
+            is_record_terminator(byte, None) && !(last == b'\r' && byte == b'\n')
+        }) {
+            return (true, bare_cr);
+        }
+        previous = is_record_terminator(byte, None).then_some(byte);
+    }
+    (false, bare_cr)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn scan_record_terminators(input: &[u8]) -> (bool, bool) {
+    let mut blank = false;
+    let mut bare_cr = false;
+    for pair in input.windows(2) {
+        blank |= is_record_terminator(pair[0], None)
+            && is_record_terminator(pair[1], None)
+            && pair != b"\r\n";
+        bare_cr |= pair[0] == b'\r' && pair[1] != b'\n';
+    }
+    (blank, bare_cr)
+}
+
 fn ignored_record_prefix(raw: &[u8], comment: Option<u8>, terminator: Option<u8>) -> usize {
     let mut offset = 0;
     while let Some(&byte) = raw.get(offset) {
@@ -298,7 +355,7 @@ pub struct RecordDecoder {
 
     /// Strict blank handling is entirely opt-in; ordinary scans keep the original path.
     blank_record_policy: CsvBlankRecordPolicy,
-    blank_null_row_nullable: bool,
+    blank_null_row_supported: bool,
     skipped_blank_records_counter: Option<Arc<AtomicU64>>,
     strict_at_record_start: bool,
     strict_pending_cr: bool,
@@ -368,7 +425,7 @@ impl RecordDecoder {
             skipping_extra_fields: false,
             record_error_handler: None,
             blank_record_policy: CsvBlankRecordPolicy::Ignore,
-            blank_null_row_nullable: false,
+            blank_null_row_supported: false,
             skipped_blank_records_counter: None,
             strict_at_record_start: true,
             strict_pending_cr: false,
@@ -448,11 +505,11 @@ impl RecordDecoder {
     pub(super) fn with_blank_record_policy(
         mut self,
         policy: CsvBlankRecordPolicy,
-        nullable_one_column: bool,
+        all_columns_nullable: bool,
         counter: Option<Arc<AtomicU64>>,
     ) -> Self {
         self.blank_record_policy = policy;
-        self.blank_null_row_nullable = nullable_one_column;
+        self.blank_null_row_supported = all_columns_nullable;
         self.skipped_blank_records_counter = counter;
         if policy == CsvBlankRecordPolicy::EmitNullRow {
             self.field_counts.get_or_insert_with(Vec::new);
@@ -530,13 +587,15 @@ impl RecordDecoder {
             ),
             None if self.blank_record_policy != CsvBlankRecordPolicy::Ignore => {
                 if self.ignore_extra_fields {
-                    self.decode_strict::<true, true>(input, to_read)
+                    self.decode_strict_blank::<true>(input, to_read)
                 } else {
-                    self.decode_strict::<false, true>(input, to_read)
+                    self.decode_strict_blank::<false>(input, to_read)
                 }
             }
-            None if self.ignore_extra_fields => self.decode_strict::<true, false>(input, to_read),
-            None => self.decode_strict::<false, false>(input, to_read),
+            None if self.ignore_extra_fields => {
+                self.decode_strict::<true, false, false, false>(input, to_read)
+            }
+            None => self.decode_strict::<false, false, false, false>(input, to_read),
         }
     }
 
@@ -558,7 +617,7 @@ impl RecordDecoder {
         if self.record_error_handler.is_none()
             && self.blank_record_policy != CsvBlankRecordPolicy::Ignore
         {
-            return self.decode(input, 1);
+            return self.decode_skipping(input, 1);
         }
         if self.blank_records_are_rows
             && self.terminator.is_some()
@@ -595,9 +654,9 @@ impl RecordDecoder {
             input
         };
         let (rows, bytes) = if self.ignore_extra_fields {
-            self.decode_strict::<true, false>(scan_input, 1)?
+            self.decode_strict::<true, false, false, false>(scan_input, 1)?
         } else {
-            self.decode_strict::<false, false>(scan_input, 1)?
+            self.decode_strict::<false, false, false, false>(scan_input, 1)?
         };
         self.source_lines.advance(&input[..bytes]);
         self.stream_offset = self
@@ -1067,6 +1126,30 @@ impl RecordDecoder {
         Ok(())
     }
 
+    fn advance_strict_position_fast(
+        &mut self,
+        input: &[u8],
+        bare_cr: bool,
+    ) -> Result<(), ArrowError> {
+        if self.blank_record_policy == CsvBlankRecordPolicy::Reject {
+            if bare_cr || self.terminator.is_some() {
+                return self.advance_strict_position(input);
+            }
+            if let Some(&first) = input.first() {
+                if self.source_lines.pending_cr && first != b'\n' {
+                    self.source_lines.bare_cr_count =
+                        self.source_lines.bare_cr_count.saturating_add(1);
+                }
+                self.source_lines.pending_cr = input.last() == Some(&b'\r');
+            }
+        }
+        self.stream_offset = self
+            .stream_offset
+            .checked_add(input.len())
+            .ok_or_else(|| ArrowError::CsvError("CSV input byte offset overflowed".into()))?;
+        Ok(())
+    }
+
     fn finish_strict<const TRACK_BLANK: bool>(
         &mut self,
         input: &[u8],
@@ -1114,13 +1197,14 @@ impl RecordDecoder {
                 )));
             }
             CsvBlankRecordPolicy::EmitNullRow => {
-                if !self.blank_null_row_nullable {
+                if !self.blank_null_row_supported {
                     return Err(ArrowError::CsvError(
-                        "CSV blank records as NULL rows require one nullable column".to_owned(),
+                        "CSV blank records as NULL rows require all columns to be nullable"
+                            .to_owned(),
                     ));
                 }
-                self.offsets[self.offsets_len] = 0;
-                self.offsets_len += 1;
+                self.offsets[self.offsets_len..self.offsets_len + self.num_columns].fill(0);
+                self.offsets_len += self.num_columns;
                 let counts = self
                     .field_counts
                     .as_mut()
@@ -1131,7 +1215,9 @@ impl RecordDecoder {
                     counts[self.num_rows] = 0;
                 }
                 if let Some(quoted) = &mut self.quoted_empty {
-                    quoted.fields.resize(self.num_rows + 1, 0);
+                    let end = self.offsets_len - 1;
+                    quoted.fields.resize(end, 0);
+                    quoted.fields[end - self.num_columns..end].fill(0);
                 }
                 self.num_rows += 1;
                 *read += 1;
@@ -1152,7 +1238,59 @@ impl RecordDecoder {
         Ok(())
     }
 
-    fn decode_strict<const IGNORE_EXTRA: bool, const TRACK_BLANK: bool>(
+    fn strict_fast_input_bare_cr(&self, input: &[u8], to_read: usize) -> Option<bool> {
+        const MAX_PREFLIGHT_BYTES_PER_ROW: usize = 64;
+        if self.comment.is_some()
+            || self.strict_comment
+            || self.strict_bom_len != 0
+            || self.quoted_empty.is_some()
+            || self.stream_offset == self.initial_stream_offset
+            || input.len() > to_read.saturating_mul(MAX_PREFLIGHT_BYTES_PER_ROW)
+        {
+            return None;
+        }
+
+        let prefix = usize::from(self.strict_pending_cr && input.first() == Some(&b'\n'));
+        if self.strict_at_record_start
+            && input
+                .get(prefix)
+                .is_some_and(|byte| is_record_terminator(*byte, self.terminator))
+        {
+            return None;
+        }
+
+        if let Some(term) = self.terminator {
+            memchr::memmem::find(input, &[term, term])
+                .is_none()
+                .then_some(true)
+        } else {
+            let (blank, bare_cr) = scan_record_terminators(input);
+            (!blank).then_some(bare_cr)
+        }
+    }
+
+    fn decode_strict_blank<const IGNORE_EXTRA: bool>(
+        &mut self,
+        input: &[u8],
+        to_read: usize,
+    ) -> Result<(usize, usize), ArrowError> {
+        let fast_bare_cr = self.strict_fast_input_bare_cr(input, to_read);
+        if let Some(bare_cr) = fast_bare_cr {
+            let (rows, bytes) =
+                self.decode_strict::<IGNORE_EXTRA, false, false, true>(input, to_read)?;
+            self.advance_strict_position_fast(&input[..bytes], bare_cr)?;
+            Ok((rows, bytes))
+        } else {
+            self.decode_strict::<IGNORE_EXTRA, true, true, false>(input, to_read)
+        }
+    }
+
+    fn decode_strict<
+        const IGNORE_EXTRA: bool,
+        const TRACK_BLANK: bool,
+        const CHECK_BLANK: bool,
+        const CAPTURE_STATE: bool,
+    >(
         &mut self,
         input: &[u8],
         to_read: usize,
@@ -1168,8 +1306,10 @@ impl RecordDecoder {
         if TRACK_BLANK && input.is_empty() && self.strict_bom_len != 0 {
             let prefix_len = self.strict_bom_len;
             self.strict_bom_len = 0;
-            let (rows, bytes) =
-                self.decode_strict::<IGNORE_EXTRA, false>(&b"\xef\xbb\xbf"[..prefix_len], to_read)?;
+            let (rows, bytes) = self.decode_strict::<IGNORE_EXTRA, false, false, false>(
+                &b"\xef\xbb\xbf"[..prefix_len],
+                to_read,
+            )?;
             debug_assert_eq!((rows, bytes), (0, prefix_len));
             self.strict_at_record_start = false;
         }
@@ -1190,6 +1330,9 @@ impl RecordDecoder {
 
         // The number of rows decoded in this pass
         let mut read = 0;
+        let mut fast_boundary_offset = 0;
+        let mut fast_at_boundary = self.strict_at_record_start;
+        let mut fast_boundary_cr = self.strict_pending_cr;
 
         loop {
             // Reserve necessary space in output data based on best estimate
@@ -1204,11 +1347,12 @@ impl RecordDecoder {
 
             // Try to read a record
             loop {
-                if TRACK_BLANK && !input.is_empty() {
+                let mut continuing_crlf = false;
+                if CHECK_BLANK && !input.is_empty() {
                     if input_offset == input.len() {
                         return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
                     }
-                    let remaining = &input[input_offset..];
+                    let mut remaining = &input[input_offset..];
                     if self.strict_bom_len != 0
                         || (self.stream_offset == self.initial_stream_offset && input_offset == 0)
                     {
@@ -1220,11 +1364,17 @@ impl RecordDecoder {
                             input_offset += 1;
                         }
                         if self.strict_bom_len == 3 {
-                            self.strict_bom_len = 0;
                             record_start = input_offset;
-                            continue;
+                            if input_offset == input.len() {
+                                return self.finish_strict::<TRACK_BLANK>(
+                                    input,
+                                    read,
+                                    input_offset,
+                                );
+                            }
+                            remaining = &input[input_offset..];
                         }
-                        if self.strict_bom_len != 0 {
+                        if self.strict_bom_len != 0 && self.strict_bom_len != 3 {
                             if input_offset == input.len() {
                                 return self.finish_strict::<TRACK_BLANK>(
                                     input,
@@ -1234,26 +1384,38 @@ impl RecordDecoder {
                             }
                             let prefix_len = self.strict_bom_len;
                             self.strict_bom_len = 0;
-                            let (rows, bytes) = self.decode_strict::<IGNORE_EXTRA, false>(
-                                &BOM[..prefix_len],
-                                to_read - read,
-                            )?;
+                            let (rows, bytes) = self
+                                .decode_strict::<IGNORE_EXTRA, false, false, false>(
+                                    &BOM[..prefix_len],
+                                    to_read - read,
+                                )?;
                             debug_assert_eq!((rows, bytes), (0, prefix_len));
                             self.strict_at_record_start = false;
                             record_start = input_offset;
                             continue;
                         }
                     }
-                    if self.strict_pending_cr {
+                    if self.strict_bom_len != 3 && self.strict_pending_cr {
                         self.strict_pending_cr = false;
                         if remaining[0] == b'\n' {
-                            self.consume_strict_ignored(&remaining[..1])?;
-                            input_offset += 1;
-                            record_start = input_offset;
-                            continue;
+                            if remaining.len() == 1
+                                || is_record_terminator(remaining[1], self.terminator)
+                                || is_comment_start(remaining[1], self.comment, self.terminator)
+                            {
+                                self.consume_strict_ignored(&remaining[..1])?;
+                                input_offset += 1;
+                                record_start = input_offset;
+                                continue;
+                            }
+                            continuing_crlf = true;
+                            record_start = input_offset + 1;
                         }
                     }
-                    if self.strict_at_record_start && !self.strict_comment {
+                    if self.strict_bom_len != 3
+                        && self.strict_at_record_start
+                        && !self.strict_comment
+                        && !continuing_crlf
+                    {
                         if is_comment_start(remaining[0], self.comment, self.terminator) {
                             self.strict_comment = true;
                         } else if is_record_terminator(remaining[0], self.terminator) {
@@ -1280,7 +1442,13 @@ impl RecordDecoder {
                     }
                 }
                 let skipping_extra_fields = IGNORE_EXTRA && self.skipping_extra_fields;
-                let scan_input = if TRACK_BLANK && self.strict_comment {
+                let mut bom_prefix = [0xef, 0xbb, 0xbf, 0];
+                let feeding_bom = CHECK_BLANK && self.strict_bom_len == 3 && !input.is_empty();
+                let scan_input = if feeding_bom {
+                    // csv_core must consume the first BOM so it retains a later BOM as data.
+                    bom_prefix[3] = input[input_offset];
+                    &bom_prefix[..]
+                } else if TRACK_BLANK && self.strict_comment {
                     let remaining = &input[input_offset..];
                     let end =
                         memchr::memchr(b'\n', remaining).map_or(remaining.len(), |index| index + 1);
@@ -1307,8 +1475,31 @@ impl RecordDecoder {
                     )
                 };
                 self.current_field += end_positions;
-                input_offset += bytes_read;
-                if TRACK_BLANK && bytes_read != 0 {
+                let input_bytes_read = if feeding_bom {
+                    self.strict_bom_len = 0;
+                    debug_assert!(bytes_read >= 3);
+                    bytes_read - 3
+                } else {
+                    bytes_read
+                };
+                input_offset += input_bytes_read;
+                if continuing_crlf {
+                    if input_bytes_read == 0 {
+                        record_start = input_before_read;
+                        self.strict_pending_cr = true;
+                    } else if input_bytes_read == 1 {
+                        record_start = input_offset;
+                        self.strict_at_record_start = true;
+                    }
+                }
+                if TRACK_BLANK && input_bytes_read != 0 {
+                    if feeding_bom
+                        && self.strict_at_record_start
+                        && !self.strict_comment
+                        && is_comment_start(input[input_before_read], self.comment, self.terminator)
+                    {
+                        self.strict_comment = true;
+                    }
                     if self.strict_comment {
                         if memchr::memchr(b'\n', &input[input_before_read..input_offset]).is_some()
                         {
@@ -1316,7 +1507,20 @@ impl RecordDecoder {
                             self.strict_at_record_start = true;
                         }
                     } else {
-                        self.strict_at_record_start = false;
+                        if !continuing_crlf || input_bytes_read > 1 {
+                            self.strict_at_record_start = false;
+                        }
+                    }
+                }
+                if feeding_bom && input_bytes_read != 0 {
+                    let first = input[input_before_read];
+                    if is_record_terminator(first, self.terminator) {
+                        let raw = &input[input_before_read..input_offset];
+                        self.handle_strict_blank(raw, &input[..input_offset], &mut read)?;
+                        record_start = input_offset;
+                        if read == to_read {
+                            return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
+                        }
                     }
                 }
                 if skipping_extra_fields {
@@ -1333,7 +1537,21 @@ impl RecordDecoder {
                 match result {
                     ReadRecordResult::End | ReadRecordResult::InputEmpty => {
                         if TRACK_BLANK && input_offset < input.len() {
+                            if self.quoted_empty.is_some() {
+                                self.record_bytes
+                                    .extend_from_slice(&input[record_start..input_offset]);
+                                record_start = input_offset;
+                            }
                             continue;
+                        }
+                        if CAPTURE_STATE {
+                            let untouched = input_offset == fast_boundary_offset;
+                            let crlf_continuation = fast_boundary_cr
+                                && input.get(fast_boundary_offset) == Some(&b'\n')
+                                && input_offset == fast_boundary_offset + 1;
+                            self.strict_at_record_start =
+                                (untouched && fast_at_boundary) || crlf_continuation;
+                            self.strict_pending_cr = untouched && fast_boundary_cr;
                         }
                         // Reached end of input
                         if self.quoted_empty.is_some() {
@@ -1371,6 +1589,12 @@ impl RecordDecoder {
                         )));
                     }
                     ReadRecordResult::Record => {
+                        if CAPTURE_STATE {
+                            fast_boundary_offset = input_offset;
+                            fast_at_boundary = true;
+                            fast_boundary_cr = self.terminator.is_none()
+                                && input.get(input_offset.saturating_sub(1)) == Some(&b'\r');
+                        }
                         if TRACK_BLANK {
                             self.strict_at_record_start = true;
                             self.strict_pending_cr = self.terminator.is_none()
@@ -1440,6 +1664,10 @@ impl RecordDecoder {
 
                         if read == to_read {
                             // Read sufficient rows
+                            if CAPTURE_STATE {
+                                self.strict_at_record_start = true;
+                                self.strict_pending_cr = fast_boundary_cr;
+                            }
                             return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
                         }
 
@@ -1447,6 +1675,10 @@ impl RecordDecoder {
                             // Input exhausted, need to read more
                             // Without this read_record will interpret the empty input
                             // byte array as indicating the end of the file
+                            if CAPTURE_STATE {
+                                self.strict_at_record_start = true;
+                                self.strict_pending_cr = fast_boundary_cr;
+                            }
                             return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
                         }
                     }
@@ -2200,7 +2432,76 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use super::{MAX_RECOVERABLE_EXCESS_FIELDS, RecordDecoder, recovery_limit_error};
+    use super::{
+        MAX_RECOVERABLE_EXCESS_FIELDS, RecordDecoder, recovery_limit_error, scan_record_terminators,
+    };
+
+    #[test]
+    fn test_strict_blank_vector_preflight_across_boundaries() {
+        for len in 0usize..=34 {
+            for index in 0..len.saturating_sub(1) {
+                for first in [b'x', b'\r', b'\n'] {
+                    for second in [b'x', b'\r', b'\n'] {
+                        let mut input = vec![b'x'; len];
+                        input[index] = first;
+                        input[index + 1] = second;
+                        let expected = input.windows(2).any(|pair| {
+                            (pair[0] == b'\r' || pair[0] == b'\n')
+                                && (pair[1] == b'\r' || pair[1] == b'\n')
+                                && pair != b"\r\n"
+                        });
+                        let bare_cr = input
+                            .windows(2)
+                            .any(|pair| pair[0] == b'\r' && pair[1] != b'\n');
+                        let actual = scan_record_terminators(&input);
+                        assert_eq!(
+                            actual.0, expected,
+                            "len={len}, index={index}, bytes={input:?}"
+                        );
+                        if !expected {
+                            assert_eq!(
+                                actual.1, bare_cr,
+                                "len={len}, index={index}, bytes={input:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_preflight_crlf_boundaries() {
+        let mut decoder = RecordDecoder::new(Reader::new(), 1, false);
+        decoder.stream_offset = 1;
+        assert_eq!(
+            decoder.strict_fast_input_bare_cr(b"one\r\ntwo\r\n", 100),
+            Some(false)
+        );
+        assert!(
+            decoder
+                .strict_fast_input_bare_cr(b"one\r\n\r\ntwo", 100)
+                .is_none()
+        );
+        assert!(
+            decoder
+                .strict_fast_input_bare_cr(b"one\n\ntwo", 100)
+                .is_none()
+        );
+
+        decoder.strict_pending_cr = true;
+        assert_eq!(decoder.strict_fast_input_bare_cr(b"\n", 100), Some(false));
+        assert_eq!(
+            decoder.strict_fast_input_bare_cr(b"\ntwo\r\n", 100),
+            Some(false)
+        );
+        assert!(
+            decoder
+                .strict_fast_input_bare_cr(b"\n\r\ntwo", 100)
+                .is_none()
+        );
+        assert!(decoder.strict_fast_input_bare_cr(b"\n\ntwo", 100).is_none());
+    }
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct OwnedRecordError {
