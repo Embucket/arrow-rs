@@ -276,6 +276,7 @@ pub struct RecordDecoder {
 
     /// Cache this capability once so the common recovery path avoids another virtual call.
     filter_records: bool,
+    record_source_lines: bool,
 
     /// Opt-in bound for a malformed record that never reaches a terminator.
     max_record_bytes: Option<usize>,
@@ -329,6 +330,7 @@ impl RecordDecoder {
             skipping_extra_fields: false,
             record_error_handler: None,
             filter_records: false,
+            record_source_lines: false,
             max_record_bytes: None,
             replace_invalid_utf8: false,
             source_lines: SourceLineCounter {
@@ -376,6 +378,9 @@ impl RecordDecoder {
         self.filter_records = handler
             .as_ref()
             .is_some_and(|handler| handler.filters_records());
+        self.record_source_lines = handler
+            .as_ref()
+            .is_some_and(|handler| handler.needs_source_line_number());
         self.max_record_bytes = handler
             .as_ref()
             .and_then(|handler| handler.max_record_bytes());
@@ -924,7 +929,7 @@ impl RecordDecoder {
                             byte_offset: self.record_byte_offset,
                             record: &self.record_bytes,
                         };
-                        if handler.needs_source_line_number() {
+                        if self.record_source_lines {
                             source_lines.advance(&input[counted_until..input_offset]);
                             counted_until = input_offset;
                             handler.handle_record_with_source_line(
@@ -1277,6 +1282,32 @@ mod tests {
         records: Mutex<Vec<OwnedRecord>>,
     }
 
+    #[derive(Debug, Default)]
+    struct SourceLines(Mutex<Vec<(usize, usize, usize)>>);
+
+    impl CsvRecordErrorHandler for SourceLines {
+        fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+
+        fn needs_source_line_number(&self) -> bool {
+            true
+        }
+
+        fn handle_record_with_source_line(
+            &self,
+            record: &CsvRecord<'_>,
+            source_line_number: usize,
+        ) -> Result<(), ArrowError> {
+            self.0.lock().unwrap().push((
+                record.line_number,
+                source_line_number,
+                record.byte_offset,
+            ));
+            Ok(())
+        }
+    }
+
     impl CsvRecordErrorHandler for CollectRecords {
         fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
             self.errors.lock().unwrap().push(OwnedRecordError {
@@ -1611,32 +1642,6 @@ mod tests {
 
     #[test]
     fn test_successful_record_source_lines_after_skipped_prefix() {
-        #[derive(Debug, Default)]
-        struct SourceLines(Mutex<Vec<(usize, usize, usize)>>);
-
-        impl CsvRecordErrorHandler for SourceLines {
-            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
-                Ok(())
-            }
-
-            fn needs_source_line_number(&self) -> bool {
-                true
-            }
-
-            fn handle_record_with_source_line(
-                &self,
-                record: &CsvRecord<'_>,
-                source_line_number: usize,
-            ) -> Result<(), ArrowError> {
-                self.0.lock().unwrap().push((
-                    record.line_number,
-                    source_line_number,
-                    record.byte_offset,
-                ));
-                Ok(())
-            }
-        }
-
         let csv = b"\"value\ncontinued\",ok\n2,good\n";
         let handler = Arc::new(SourceLines::default());
         let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
@@ -1647,6 +1652,28 @@ mod tests {
             *handler.0.lock().unwrap(),
             [(1, 2, 7), (2, 4, 7 + b"\"value\ncontinued\",ok\n".len())]
         );
+    }
+
+    #[test]
+    fn test_successful_record_source_lines_split_crlf_custom_terminator() {
+        let csv = b"1,a\r\nb|2,ok|";
+        let mut builder = csv_core::ReaderBuilder::new();
+        builder.terminator(csv_core::Terminator::Any(b'|'));
+        let handler = Arc::new(SourceLines::default());
+        let mut decoder = RecordDecoder::new(builder.build(), 2, false)
+            .with_ignored_prefix_options(None, Some(b'|'))
+            .with_record_error_handler(Some(handler.clone()));
+        let mut reader = BufReader::with_capacity(1, Cursor::new(csv));
+        while decoder.len() < 2 {
+            let buf = reader.fill_buf().unwrap();
+            let (_, consumed) = decoder.decode(buf, 2 - decoder.len()).unwrap();
+            reader.consume(consumed);
+            if consumed == 0 {
+                break;
+            }
+        }
+        assert_eq!(decoder.len(), 2);
+        assert_eq!(*handler.0.lock().unwrap(), [(1, 1, 0), (2, 2, 7)]);
     }
 
     #[test]
