@@ -302,6 +302,7 @@ pub struct RecordDecoder {
 
     /// Total number of input bytes consumed by the recovery path.
     stream_offset: usize,
+    initial_stream_offset: usize,
 
     /// Start offsets for rolling back a malformed record from decoded output.
     record_byte_offset: usize,
@@ -344,6 +345,7 @@ impl RecordDecoder {
             record_needs_utf8_validation: false,
             record_bytes: vec![],
             stream_offset: 0,
+            initial_stream_offset: 0,
             record_byte_offset: 0,
             record_data_start: 0,
             record_offsets_start: 1,
@@ -355,9 +357,9 @@ impl RecordDecoder {
         skipped_lines: usize,
         skipped_bytes: usize,
     ) -> Self {
-        self.line_number = skipped_lines.saturating_add(1);
         self.source_lines.initial_line_offset = skipped_lines;
         self.stream_offset = skipped_bytes;
+        self.initial_stream_offset = skipped_bytes;
         self.record_byte_offset = skipped_bytes;
         self
     }
@@ -721,7 +723,7 @@ impl RecordDecoder {
                     self.offsets.len().min(max_offsets_len)
                 };
                 let record_input_start = input_offset;
-                let bom_stripped = self.stream_offset == 0
+                let bom_stripped = self.stream_offset == self.initial_stream_offset
                     && input[record_input_start..].starts_with(b"\xef\xbb\xbf");
                 let (result, bytes_read, bytes_written, end_positions) = if skipping_extra_fields {
                     let mut skipped_data = [0_u8; 1024];

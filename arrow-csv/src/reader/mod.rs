@@ -190,7 +190,8 @@ pub struct CsvRecordError<'a> {
     pub line_number: usize,
     /// One-based physical line containing the start of the malformed record.
     pub source_line_number: usize,
-    /// Zero-based byte offset of the start of the record in the input stream.
+    /// Zero-based byte offset in the supplied input, or in the original source
+    /// when [`ReaderBuilder::with_initial_source_position`] is set.
     pub byte_offset: usize,
     /// Number of fields required by the reader schema.
     pub expected_fields: usize,
@@ -205,7 +206,8 @@ pub struct CsvRecordError<'a> {
 pub struct CsvRecord<'a> {
     /// One-based record number, including any header row.
     pub line_number: usize,
-    /// Zero-based byte offset of the start of the record in the input stream.
+    /// Zero-based byte offset in the supplied input, or in the original source
+    /// when [`ReaderBuilder::with_initial_source_position`] is set.
     pub byte_offset: usize,
     /// Original record bytes, including its record terminator when present.
     pub record: &'a [u8],
@@ -218,7 +220,8 @@ pub struct CsvFilterRecord<'a> {
     pub line_number: usize,
     /// One-based physical line containing the start of the record.
     pub source_line_number: usize,
-    /// Zero-based byte offset of the start of the record in the input stream.
+    /// Zero-based byte offset in the supplied input, or in the original source
+    /// when [`ReaderBuilder::with_initial_source_position`] is set.
     pub byte_offset: usize,
     /// Original record bytes, including its record terminator when present.
     pub record: &'a [u8],
@@ -231,7 +234,8 @@ pub struct CsvInvalidUtf8Error<'a> {
     pub line_number: usize,
     /// One-based physical line containing the start of the malformed record.
     pub source_line_number: usize,
-    /// Zero-based byte offset of the start of the record in the input stream.
+    /// Zero-based byte offset in the supplied input, or in the original source
+    /// when [`ReaderBuilder::with_initial_source_position`] is set.
     pub byte_offset: usize,
     /// Zero-based index of the decoded field containing invalid UTF-8.
     pub field_index: usize,
@@ -1788,7 +1792,8 @@ impl ReaderBuilder {
     }
 
     /// Set the physical lines and bytes consumed before the input passed to
-    /// this reader. Record diagnostics retain offsets into the original source.
+    /// this reader. Record diagnostics retain offsets into the original source;
+    /// record ordinals still begin at one for the supplied input.
     pub fn with_initial_source_position(mut self, lines: usize, bytes: usize) -> Self {
         self.source_line_offset = lines;
         self.source_byte_offset = bytes;
@@ -1977,8 +1982,8 @@ impl ReaderBuilder {
             to_skip: start,
             header_validation: self.format.header && self.format.header_validation,
             record_decoder,
-            line_number: start.saturating_add(self.source_line_offset),
-            end: end.saturating_add(self.source_line_offset),
+            line_number: start,
+            end,
             projection: self.projection,
             batch_size: self.batch_size,
             null_regex: self.format.null_regex,
@@ -2024,7 +2029,50 @@ mod tests {
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             1
         );
-        assert_eq!(*positions.0.lock().unwrap(), [(2, 2, 8)]);
+        assert_eq!(*positions.0.lock().unwrap(), [(1, 2, 8)]);
+
+        let positions = Arc::new(CaptureSourcePositions::default());
+        let reader = ReaderBuilder::new(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ])))
+        .with_initial_source_position(2, 10)
+        .with_record_error_handler(positions.clone())
+        .build("1,bad,extra\n".as_bytes())
+        .unwrap();
+        reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(*positions.0.lock().unwrap(), [(1, 3, 10)]);
+    }
+
+    #[test]
+    fn test_positioned_reader_handles_bom_and_large_line_offset() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let prefix = b"\xef\xbb\xbf# comment\n1,ok\n";
+        let positions = Arc::new(CaptureSourcePositions::default());
+        let reader = ReaderBuilder::new(schema.clone())
+            .with_comment(b'#')
+            .with_initial_source_position(1, 8)
+            .with_record_error_handler(positions.clone())
+            .build(b"\xef\xbb\xbf# comment\n1,ok\n2,extra,value\n".as_slice())
+            .unwrap();
+        reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let positions = positions.0.lock().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].1, 4);
+        assert_eq!(positions[0].2, 8 + prefix.len());
+        drop(positions);
+
+        let positions = Arc::new(CaptureSourcePositions::default());
+        let reader = ReaderBuilder::new(schema)
+            .with_initial_source_position(usize::MAX, 0)
+            .with_record_error_handler(positions.clone())
+            .build("1,bad,extra\n".as_bytes())
+            .unwrap();
+        reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(*positions.0.lock().unwrap(), [(1, usize::MAX, 0)]);
     }
 
     #[derive(Debug)]
