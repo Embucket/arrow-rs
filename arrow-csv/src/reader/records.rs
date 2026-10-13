@@ -38,7 +38,7 @@ struct QuotedEmptyFields {
 fn ignored_record_prefix(raw: &[u8], comment: Option<u8>, terminator: Option<u8>) -> usize {
     let mut offset = 0;
     while let Some(&byte) = raw.get(offset) {
-        if Some(byte) == comment {
+        if Some(byte) == comment && Some(byte) != terminator {
             let Some(end) = raw[offset..].iter().position(|byte| *byte == b'\n') else {
                 break;
             };
@@ -485,6 +485,7 @@ impl RecordDecoder {
     ) -> Result<(usize, usize), ArrowError> {
         if self.blank_records_are_rows
             && self.terminator.is_some()
+            && self.comment != self.terminator
             && (self.skipping_custom_comment || input.first().copied() == self.comment)
         {
             let mut input_offset = 0;
@@ -545,12 +546,14 @@ impl RecordDecoder {
             input
         };
         if self.comment.is_some()
+            && self.comment != self.terminator
             && self.record_bytes.first().copied() == self.comment
             && let Some(end) = memchr::memchr(b'\n', remaining)
         {
             remaining = &remaining[end + 1..];
         }
         while let Some(comment) = self.comment
+            && Some(comment) != self.terminator
             && remaining.first() == Some(&comment)
         {
             let Some(end) = memchr::memchr(b'\n', remaining) else {
@@ -643,7 +646,7 @@ impl RecordDecoder {
                     continue;
                 }
             }
-            if Some(raw[offset]) == self.comment {
+            if Some(raw[offset]) == self.comment && Some(raw[offset]) != self.terminator {
                 let newline = raw[offset..]
                     .iter()
                     .position(|byte| *byte == b'\n')
@@ -707,7 +710,7 @@ impl RecordDecoder {
         }
         let continuation = matches!(self.pending_cr, Some(PendingCr::Data)) && byte == b'\n';
         self.pending_cr = None;
-        if Some(byte) == self.comment
+        if (Some(byte) == self.comment && Some(byte) != self.terminator)
             || (self.stream_offset == 0 && input[*input_offset..].starts_with(b"\xef\xbb\xbf"))
         {
             return Ok(false);
@@ -866,6 +869,7 @@ impl RecordDecoder {
             return true;
         }
         if let Some(comment) = self.comment
+            && Some(comment) != self.terminator
             && (memchr::memchr(comment, input).is_some()
                 || self.record_bytes.first() == Some(&comment))
         {
@@ -1177,6 +1181,7 @@ impl RecordDecoder {
                 } else if BLANK_AS_ROW
                     && self.current_field == 0
                     && self.comment.is_some()
+                    && self.comment != self.terminator
                     && (remaining_input.first().copied() == self.comment
                         || self.record_bytes.first().copied() == self.comment)
                 {
@@ -2117,6 +2122,41 @@ mod tests {
             ["a", "", "b"]
         );
         assert!(handler.blanks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_custom_terminator_takes_precedence_over_comment() {
+        for validate_header in [false, true] {
+            let handler = Arc::new(CollectRecords {
+                materialize_blanks: true,
+                ..Default::default()
+            });
+            let mut builder = csv_core::ReaderBuilder::new();
+            builder.comment(Some(b'|'));
+            builder.terminator(csv_core::Terminator::Any(b'|'));
+            let mut decoder = RecordDecoder::new(builder.build(), 1, false)
+                .with_ignored_prefix_options(Some(b'|'), Some(b'|'))
+                .with_record_error_handler(Some(handler));
+            if validate_header {
+                assert_eq!(
+                    decoder.decode_validating_header(b"|value|").unwrap(),
+                    (1, 1)
+                );
+                assert_eq!(decoder.flush().unwrap().get(0).get(0), "");
+            } else {
+                let (rows, bytes) = decoder.decode(b"a||b|", 3).unwrap();
+                assert_eq!((rows, bytes), (3, 5));
+                assert_eq!(
+                    decoder
+                        .flush()
+                        .unwrap()
+                        .iter()
+                        .map(|record| record.get(0))
+                        .collect::<Vec<_>>(),
+                    ["a", "", "b"]
+                );
+            }
+        }
     }
 
     #[test]
