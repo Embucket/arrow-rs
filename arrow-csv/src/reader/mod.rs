@@ -283,6 +283,13 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
         false
     }
 
+    /// Opt in to treating physical blank lines as empty one-column records.
+    /// This is supported only for a single-column schema. The default reader
+    /// still skips blank lines.
+    fn blank_records_are_rows(&self) -> bool {
+        false
+    }
+
     /// Observe one blank physical record, including its record terminator.
     fn handle_blank_record(&self, _record: &CsvFilterRecord<'_>) -> Result<(), ArrowError> {
         Ok(())
