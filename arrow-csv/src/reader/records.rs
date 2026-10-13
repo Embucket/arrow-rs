@@ -2440,8 +2440,8 @@ mod tests {
     fn test_strict_blank_vector_preflight_across_boundaries() {
         for len in 0usize..=34 {
             for index in 0..len.saturating_sub(1) {
-                for first in [b'x', b'\r', b'\n'] {
-                    for second in [b'x', b'\r', b'\n'] {
+                for &first in b"x\r\n" {
+                    for &second in b"x\r\n" {
                         let mut input = vec![b'x'; len];
                         input[index] = first;
                         input[index + 1] = second;
