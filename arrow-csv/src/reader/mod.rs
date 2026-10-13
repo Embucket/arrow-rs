@@ -1238,6 +1238,9 @@ impl Decoder {
                 validate_header(&rows, self.schema.fields())?;
                 self.header_validation = false;
                 self.to_skip -= 1;
+                if bytes == 0 && !buf.is_empty() {
+                    return self.decode(buf);
+                }
                 return Ok(bytes);
             }
 
@@ -1246,6 +1249,9 @@ impl Decoder {
             let (skipped, bytes) = self.record_decoder.decode_skipping(buf, to_skip)?;
             self.to_skip -= skipped;
             self.record_decoder.clear();
+            if bytes == 0 && skipped > 0 && !buf.is_empty() {
+                return self.decode(buf);
+            }
             return Ok(bytes);
         }
 
@@ -2149,6 +2155,43 @@ mod tests {
         assert_eq!(batch.num_rows(), 3);
         assert!(batch.column(0).is_null(1));
         assert!(batch.column(1).is_null(1));
+    }
+
+    #[test]
+    fn test_split_cr_blank_header_does_not_hide_first_data_row() {
+        #[derive(Debug)]
+        struct BlankRows;
+
+        impl CsvRecordErrorHandler for BlankRows {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                true
+            }
+        }
+
+        for validate in [false, true] {
+            let field_name = if validate { "" } else { "value" };
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                field_name,
+                DataType::Utf8,
+                true,
+            )]));
+            let input = std::io::BufReader::with_capacity(1, Cursor::new(b"\rX\n"));
+            let batches = ReaderBuilder::new(schema)
+                .with_header(true)
+                .with_header_validation(validate)
+                .with_record_error_handler(Arc::new(BlankRows))
+                .build_buffered(input)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.len(), 1, "validate={validate}");
+            assert_eq!(batches[0].num_rows(), 1);
+            assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "X");
+        }
     }
 
     #[test]
