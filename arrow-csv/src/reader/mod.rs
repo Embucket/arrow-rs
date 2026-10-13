@@ -298,6 +298,23 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
         Ok(false)
     }
 
+    /// Opt in to observing physical blank lines omitted by the CSV parser.
+    fn reports_blank_records(&self) -> bool {
+        false
+    }
+
+    /// Opt in to treating physical blank lines as empty one-column records.
+    /// This is supported only for a single-column schema. The default reader
+    /// still skips blank lines.
+    fn blank_records_are_rows(&self) -> bool {
+        false
+    }
+
+    /// Observe one blank physical record, including its record terminator.
+    fn handle_blank_record(&self, _record: &CsvFilterRecord<'_>) -> Result<(), ArrowError> {
+        Ok(())
+    }
+
     /// Optional upper bound for a raw record in the recovery decoder.
     fn max_record_bytes(&self) -> Option<usize> {
         None
