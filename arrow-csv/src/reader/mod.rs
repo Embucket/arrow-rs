@@ -267,6 +267,22 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
         Ok(())
     }
 
+    /// Whether successful-record callbacks need the physical source line.
+    fn needs_source_line_number(&self) -> bool {
+        false
+    }
+
+    /// Observe a decoded record with its one-based physical source line.
+    ///
+    /// The default keeps existing handlers compatible with this callback.
+    fn handle_record_with_source_line(
+        &self,
+        record: &CsvRecord<'_>,
+        _source_line_number: usize,
+    ) -> Result<(), ArrowError> {
+        self.handle_record(record)
+    }
+
     /// Opt in to filtering decoded records before they enter a batch.
     fn filters_records(&self) -> bool {
         false
