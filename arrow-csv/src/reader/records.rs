@@ -503,10 +503,18 @@ impl RecordDecoder {
         if self.blank_records_are_rows && self.header_starts_with_blank(input) {
             return self.decode(input, 1);
         }
-        let (rows, bytes) = if self.ignore_extra_fields {
-            self.decode_strict::<true>(input, 1)?
+        let scan_input = if self.blank_records_are_rows
+            && self.stream_offset > 0
+            && input.starts_with(b"\xef\xbb\xbf")
+        {
+            &input[..1]
         } else {
-            self.decode_strict::<false>(input, 1)?
+            input
+        };
+        let (rows, bytes) = if self.ignore_extra_fields {
+            self.decode_strict::<true>(scan_input, 1)?
+        } else {
+            self.decode_strict::<false>(scan_input, 1)?
         };
         self.source_lines.advance(&input[..bytes]);
         self.stream_offset = self
@@ -811,6 +819,7 @@ impl RecordDecoder {
             if self.current_field != 0
                 || !self.record_bytes.is_empty()
                 || input.get(*input_offset) != Some(&comment)
+                || (self.stream_offset == 0 && input[*input_offset..].starts_with(b"\xef\xbb\xbf"))
             {
                 return Ok(false);
             }
@@ -853,13 +862,13 @@ impl RecordDecoder {
         if self.skipping_custom_comment {
             return true;
         }
+        if input.len() > to_read.saturating_mul(MAX_PREFLIGHT_BYTES_PER_ROW) {
+            return true;
+        }
         if let Some(comment) = self.comment
             && (memchr::memchr(comment, input).is_some()
                 || self.record_bytes.first() == Some(&comment))
         {
-            return true;
-        }
-        if input.len() > to_read.saturating_mul(MAX_PREFLIGHT_BYTES_PER_ROW) {
             return true;
         }
         let after_bom = input.strip_prefix(b"\xef\xbb\xbf").unwrap_or(input);
@@ -1160,6 +1169,11 @@ impl RecordDecoder {
                     self.stream_offset == 0 && remaining_input.starts_with(b"\xef\xbb\xbf");
                 let scan_input = if BLANK_AS_ROW && initial_bom {
                     &remaining_input[..3]
+                } else if self.blank_records_are_rows
+                    && self.stream_offset > 0
+                    && remaining_input.starts_with(b"\xef\xbb\xbf")
+                {
+                    &remaining_input[..1]
                 } else if BLANK_AS_ROW
                     && self.current_field == 0
                     && self.comment.is_some()
@@ -2139,6 +2153,70 @@ mod tests {
                 }
             }
             assert_eq!(actual, ["a", "", "b"], "capacity={capacity}");
+        }
+    }
+
+    #[test]
+    fn test_custom_comment_does_not_strip_later_bom() {
+        let csv = b"#c\n\xef\xbb\xbfvalue|";
+        for validate_header in [false, true] {
+            let handler = Arc::new(CollectRecords {
+                materialize_blanks: true,
+                ..Default::default()
+            });
+            let mut builder = csv_core::ReaderBuilder::new();
+            builder.comment(Some(b'#'));
+            builder.terminator(csv_core::Terminator::Any(b'|'));
+            let mut decoder = RecordDecoder::new(builder.build(), 1, false)
+                .with_ignored_prefix_options(Some(b'#'), Some(b'|'))
+                .with_record_error_handler(Some(handler));
+            let mut consumed = 0;
+            for _ in 0..10 {
+                let (rows, bytes) = if validate_header {
+                    decoder.decode_validating_header(&csv[consumed..]).unwrap()
+                } else {
+                    decoder.decode(&csv[consumed..], 1).unwrap()
+                };
+                consumed += bytes;
+                if rows == 1 {
+                    break;
+                }
+                assert!(bytes > 0);
+            }
+            assert_eq!(decoder.len(), 1);
+            assert_eq!(decoder.flush().unwrap().get(0).get(0), "\u{feff}value");
+        }
+    }
+
+    #[test]
+    fn test_initial_bom_precedes_custom_comment_marker() {
+        let csv = b"\xef\xbb\xbfvalue|";
+        for validate_header in [false, true] {
+            let handler = Arc::new(CollectRecords {
+                materialize_blanks: true,
+                ..Default::default()
+            });
+            let mut builder = csv_core::ReaderBuilder::new();
+            builder.comment(Some(0xef));
+            builder.terminator(csv_core::Terminator::Any(b'|'));
+            let mut decoder = RecordDecoder::new(builder.build(), 1, false)
+                .with_ignored_prefix_options(Some(0xef), Some(b'|'))
+                .with_record_error_handler(Some(handler));
+            let mut consumed = 0;
+            for _ in 0..10 {
+                let (rows, bytes) = if validate_header {
+                    decoder.decode_validating_header(&csv[consumed..]).unwrap()
+                } else {
+                    decoder.decode(&csv[consumed..], 1).unwrap()
+                };
+                consumed += bytes;
+                if rows == 1 {
+                    break;
+                }
+                assert!(bytes > 0);
+            }
+            assert_eq!(decoder.len(), 1);
+            assert_eq!(decoder.flush().unwrap().get(0).get(0), "value");
         }
     }
 
@@ -3428,6 +3506,57 @@ mod tests {
                 elapsed.push(started.elapsed());
             }
             println!("CSV one-column materialize={materialize}: {elapsed:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "focused performance check for bounded CSV comment preflight"]
+    fn bench_one_column_blank_as_rows_small_batches_with_comments() {
+        #[derive(Debug)]
+        struct Noop {
+            materialize: bool,
+        }
+        impl CsvRecordErrorHandler for Noop {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+            fn blank_records_are_rows(&self) -> bool {
+                self.materialize
+            }
+        }
+
+        const ROWS: usize = 100_000;
+        const BATCH: usize = 64;
+        let csv = b"value\n".repeat(ROWS);
+        for materialize in [false, true] {
+            let handler = Arc::new(Noop { materialize });
+            let mut elapsed = Vec::new();
+            for _ in 0..5 {
+                let mut builder = csv_core::ReaderBuilder::new();
+                builder.comment(Some(b'#'));
+                let mut decoder = RecordDecoder::new(builder.build(), 1, false)
+                    .with_ignored_prefix_options(Some(b'#'), None)
+                    .with_utf8_preserving_syntax(true)
+                    .with_record_error_handler(Some(handler.clone()));
+                let started = Instant::now();
+                let mut consumed = 0;
+                let mut rows = 0;
+                while consumed < csv.len() {
+                    let (decoded, bytes) = decoder
+                        .decode(&csv[consumed..], BATCH - decoder.len())
+                        .unwrap();
+                    assert!(bytes > 0);
+                    consumed += bytes;
+                    rows += decoded;
+                    if decoder.len() == BATCH {
+                        assert_eq!(decoder.flush().unwrap().len(), BATCH);
+                    }
+                }
+                assert_eq!(rows, ROWS);
+                assert_eq!(decoder.flush().unwrap().len(), ROWS % BATCH);
+                elapsed.push(started.elapsed());
+            }
+            println!("CSV comments enabled, batch={BATCH}, materialize={materialize}: {elapsed:?}");
         }
     }
 
