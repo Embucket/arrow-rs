@@ -17,11 +17,14 @@
 
 use arrow_schema::ArrowError;
 use csv_core::{ReadRecordResult, Reader};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use super::{
-    CsvFilterRecord, CsvInvalidUtf8Error, CsvRecord, CsvRecordError, CsvRecordErrorHandler,
-    NullRegex,
+    CsvBlankRecordPolicy, CsvFilterRecord, CsvInvalidUtf8Error, CsvRecord, CsvRecordError,
+    CsvRecordErrorHandler, NullRegex,
 };
 
 #[derive(Debug)]
@@ -41,6 +44,63 @@ fn is_record_terminator(byte: u8, terminator: Option<u8>) -> bool {
 
 fn is_comment_start(byte: u8, comment: Option<u8>, terminator: Option<u8>) -> bool {
     Some(byte) == comment && !is_record_terminator(byte, terminator)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn scan_record_terminators(input: &[u8]) -> (bool, bool) {
+    use std::arch::x86_64::{
+        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+    };
+
+    // SSE2 is part of the x86-64 baseline. Compare 16 bytes at once and
+    // exclude CRLF, which is one record delimiter rather than two.
+    let (cr_byte, lf_byte) = unsafe { (_mm_set1_epi8(b'\r' as i8), _mm_set1_epi8(b'\n' as i8)) };
+    let mut offset = 0;
+    let mut previous = None;
+    let mut bare_cr = false;
+    while input.len() - offset >= 16 {
+        let (cr, lf) = unsafe {
+            let word = _mm_loadu_si128(input.as_ptr().add(offset).cast::<__m128i>());
+            (
+                _mm_movemask_epi8(_mm_cmpeq_epi8(word, cr_byte)) as u32,
+                _mm_movemask_epi8(_mm_cmpeq_epi8(word, lf_byte)) as u32,
+            )
+        };
+        let terminators = cr | lf;
+        bare_cr |= cr & 0x7fff & !(lf >> 1) != 0;
+        bare_cr |= previous == Some(b'\r') && lf & 1 == 0;
+        if (terminators & (terminators << 1) & !((cr << 1) & lf)) != 0 {
+            return (true, bare_cr);
+        }
+        if previous.is_some_and(|last| terminators & 1 != 0 && !(last == b'\r' && lf & 1 != 0)) {
+            return (true, bare_cr);
+        }
+        previous = is_record_terminator(input[offset + 15], None).then_some(input[offset + 15]);
+        offset += 16;
+    }
+    for &byte in &input[offset..] {
+        bare_cr |= previous == Some(b'\r') && byte != b'\n';
+        if previous.is_some_and(|last| {
+            is_record_terminator(byte, None) && !(last == b'\r' && byte == b'\n')
+        }) {
+            return (true, bare_cr);
+        }
+        previous = is_record_terminator(byte, None).then_some(byte);
+    }
+    (false, bare_cr)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn scan_record_terminators(input: &[u8]) -> (bool, bool) {
+    let mut blank = false;
+    let mut bare_cr = false;
+    for pair in input.windows(2) {
+        blank |= is_record_terminator(pair[0], None)
+            && is_record_terminator(pair[1], None)
+            && pair != b"\r\n";
+        bare_cr |= pair[0] == b'\r' && pair[1] != b'\n';
+    }
+    (blank, bare_cr)
 }
 
 fn ignored_record_prefix(raw: &[u8], comment: Option<u8>, terminator: Option<u8>) -> usize {
@@ -73,6 +133,7 @@ fn count_source_line_breaks(raw: &[u8]) -> usize {
 
 #[derive(Clone, Copy, Debug)]
 struct SourceLineCounter {
+    initial_line_offset: usize,
     lf_count: usize,
     count_lf_independently: bool,
     bare_cr_count: usize,
@@ -83,6 +144,11 @@ struct SourceLineCounter {
 enum PendingCr {
     Data,
     Blank {
+        line_number: usize,
+        source_line_number: usize,
+        byte_offset: usize,
+    },
+    MaterializedBlank {
         line_number: usize,
         source_line_number: usize,
         byte_offset: usize,
@@ -122,7 +188,9 @@ impl SourceLineCounter {
             .saturating_add(usize::from(
                 self.pending_cr && record.last() == Some(&b'\r'),
             ));
-        end_line.saturating_sub(count_source_line_breaks(record))
+        end_line
+            .saturating_sub(count_source_line_breaks(record))
+            .saturating_add(self.initial_line_offset)
     }
 }
 
@@ -285,8 +353,18 @@ pub struct RecordDecoder {
     /// Optional recovery hook. Keeping this `None` selects the allocation-free strict path.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
 
+    /// Strict blank handling is entirely opt-in; ordinary scans keep the original path.
+    blank_record_policy: CsvBlankRecordPolicy,
+    blank_null_row_supported: bool,
+    skipped_blank_records_counter: Option<Arc<AtomicU64>>,
+    strict_at_record_start: bool,
+    strict_pending_cr: bool,
+    strict_comment: bool,
+    strict_bom_len: usize,
+
     /// Cache this capability once so the common recovery path avoids another virtual call.
     filter_records: bool,
+    record_source_lines: bool,
 
     /// Keep the ordinary recovery path free of blank-record callbacks.
     report_blank_records: bool,
@@ -320,6 +398,7 @@ pub struct RecordDecoder {
 
     /// Total number of input bytes consumed by the recovery path.
     stream_offset: usize,
+    initial_stream_offset: usize,
 
     /// Start offsets for rolling back a malformed record from decoded output.
     record_byte_offset: usize,
@@ -345,13 +424,22 @@ impl RecordDecoder {
             ignore_extra_fields: false,
             skipping_extra_fields: false,
             record_error_handler: None,
+            blank_record_policy: CsvBlankRecordPolicy::Ignore,
+            blank_null_row_supported: false,
+            skipped_blank_records_counter: None,
+            strict_at_record_start: true,
+            strict_pending_cr: false,
+            strict_comment: false,
+            strict_bom_len: 0,
             filter_records: false,
+            record_source_lines: false,
             report_blank_records: false,
             blank_records_are_rows: false,
             pending_cr: None,
             max_record_bytes: None,
             replace_invalid_utf8: false,
             source_lines: SourceLineCounter {
+                initial_line_offset: 0,
                 lf_count: 0,
                 count_lf_independently: true,
                 bare_cr_count: 0,
@@ -366,10 +454,23 @@ impl RecordDecoder {
             record_needs_utf8_validation: false,
             record_bytes: vec![],
             stream_offset: 0,
+            initial_stream_offset: 0,
             record_byte_offset: 0,
             record_data_start: 0,
             record_offsets_start: 1,
         }
+    }
+
+    pub(crate) fn with_initial_source_position(
+        mut self,
+        skipped_lines: usize,
+        skipped_bytes: usize,
+    ) -> Self {
+        self.source_lines.initial_line_offset = skipped_lines;
+        self.stream_offset = skipped_bytes;
+        self.initial_stream_offset = skipped_bytes;
+        self.record_byte_offset = skipped_bytes;
+        self
     }
 
     pub fn with_ignore_extra_fields(mut self, ignore: bool) -> Self {
@@ -384,6 +485,9 @@ impl RecordDecoder {
         self.filter_records = handler
             .as_ref()
             .is_some_and(|handler| handler.filters_records());
+        self.record_source_lines = handler
+            .as_ref()
+            .is_some_and(|handler| handler.needs_source_line_number());
         self.blank_records_are_rows = handler
             .as_ref()
             .is_some_and(|handler| handler.blank_records_are_rows());
@@ -395,6 +499,21 @@ impl RecordDecoder {
             .as_ref()
             .and_then(|handler| handler.max_record_bytes());
         self.record_error_handler = handler;
+        self
+    }
+
+    pub(super) fn with_blank_record_policy(
+        mut self,
+        policy: CsvBlankRecordPolicy,
+        all_columns_nullable: bool,
+        counter: Option<Arc<AtomicU64>>,
+    ) -> Self {
+        self.blank_record_policy = policy;
+        self.blank_null_row_supported = all_columns_nullable;
+        self.skipped_blank_records_counter = counter;
+        if policy == CsvBlankRecordPolicy::EmitNullRow {
+            self.field_counts.get_or_insert_with(Vec::new);
+        }
         self
     }
 
@@ -442,15 +561,14 @@ impl RecordDecoder {
     ///
     /// Note: this expects to be called with an empty `input` to signal EOF
     pub fn decode(&mut self, input: &[u8], to_read: usize) -> Result<(usize, usize), ArrowError> {
-        if self.blank_records_are_rows && self.num_columns != 1 {
+        if self.blank_records_are_rows && self.num_columns == 0 {
             return Err(ArrowError::CsvError(
-                "CSV blank records can be rows only with a one-column schema".to_owned(),
+                "CSV blank records as rows require at least one column".to_owned(),
             ));
         }
         match self.record_error_handler.clone() {
             Some(handler)
-                if self.blank_records_are_rows
-                    && self.input_may_have_one_column_blank(input, to_read) =>
+                if self.blank_records_are_rows && self.input_may_have_blank(input, to_read) =>
             {
                 self.decode_with_record_error_handler::<true, true>(
                     input,
@@ -467,8 +585,17 @@ impl RecordDecoder {
                 to_read,
                 handler.as_ref(),
             ),
-            None if self.ignore_extra_fields => self.decode_strict::<true>(input, to_read),
-            None => self.decode_strict::<false>(input, to_read),
+            None if self.blank_record_policy != CsvBlankRecordPolicy::Ignore => {
+                if self.ignore_extra_fields {
+                    self.decode_strict_blank::<true>(input, to_read)
+                } else {
+                    self.decode_strict_blank::<false>(input, to_read)
+                }
+            }
+            None if self.ignore_extra_fields => {
+                self.decode_strict::<true, false, false, false>(input, to_read)
+            }
+            None => self.decode_strict::<false, false, false, false>(input, to_read),
         }
     }
 
@@ -487,6 +614,11 @@ impl RecordDecoder {
         &mut self,
         input: &[u8],
     ) -> Result<(usize, usize), ArrowError> {
+        if self.record_error_handler.is_none()
+            && self.blank_record_policy != CsvBlankRecordPolicy::Ignore
+        {
+            return self.decode_skipping(input, 1);
+        }
         if self.blank_records_are_rows
             && self.terminator.is_some()
             && self
@@ -507,11 +639,14 @@ impl RecordDecoder {
                 return Ok((0, input_offset));
             }
         }
-        if self.blank_records_are_rows && self.header_starts_with_blank(input) {
+        if self.blank_records_are_rows
+            && (matches!(self.pending_cr, Some(PendingCr::MaterializedBlank { .. }))
+                || self.header_starts_with_blank(input))
+        {
             return self.decode(input, 1);
         }
         let scan_input = if self.blank_records_are_rows
-            && self.stream_offset > 0
+            && self.stream_offset > self.initial_stream_offset
             && input.starts_with(b"\xef\xbb\xbf")
         {
             &input[..1]
@@ -519,9 +654,9 @@ impl RecordDecoder {
             input
         };
         let (rows, bytes) = if self.ignore_extra_fields {
-            self.decode_strict::<true>(scan_input, 1)?
+            self.decode_strict::<true, false, false, false>(scan_input, 1)?
         } else {
-            self.decode_strict::<false>(scan_input, 1)?
+            self.decode_strict::<false, false, false, false>(scan_input, 1)?
         };
         self.source_lines.advance(&input[..bytes]);
         self.stream_offset = self
@@ -548,7 +683,7 @@ impl RecordDecoder {
         if self.current_field != 0 || (!self.record_bytes.is_empty() && !pending_comment) {
             return false;
         }
-        let mut remaining = if self.stream_offset == 0 {
+        let mut remaining = if self.stream_offset == self.initial_stream_offset {
             input.strip_prefix(b"\xef\xbb\xbf").unwrap_or(input)
         } else {
             input
@@ -592,11 +727,18 @@ impl RecordDecoder {
         handler: &dyn CsvRecordErrorHandler,
         with_lf: bool,
     ) -> Result<(), ArrowError> {
-        if let Some(PendingCr::Blank {
+        let Some(pending) = *pending_cr else {
+            return Ok(());
+        };
+        if matches!(pending, PendingCr::MaterializedBlank { .. }) {
+            return Ok(());
+        }
+        *pending_cr = None;
+        if let PendingCr::Blank {
             line_number,
             source_line_number,
             byte_offset,
-        }) = pending_cr.take()
+        } = pending
         {
             handler.handle_blank_record(&CsvFilterRecord {
                 line_number,
@@ -686,8 +828,62 @@ impl RecordDecoder {
         Ok(())
     }
 
+    fn materialize_blank_record(
+        &mut self,
+        handler: &dyn CsvRecordErrorHandler,
+        raw: &[u8],
+        line_number: usize,
+        source_line_number: usize,
+        byte_offset: usize,
+        read: &mut usize,
+    ) -> Result<(), ArrowError> {
+        let skipped =
+            if !self.skipping_records && self.filter_records && handler.has_record_error(raw) {
+                handler.skip_record(&CsvFilterRecord {
+                    line_number,
+                    source_line_number,
+                    byte_offset,
+                    record: raw,
+                })?
+            } else {
+                false
+            };
+        if !self.skipping_records && !skipped {
+            let record = CsvRecord {
+                line_number,
+                byte_offset,
+                record: raw,
+            };
+            if self.record_source_lines {
+                handler.handle_record_with_source_line(&record, source_line_number)?;
+            } else {
+                handler.handle_record(&record)?;
+            }
+            self.offsets[self.offsets_len..self.offsets_len + self.num_columns].fill(0);
+            self.offsets_len += self.num_columns;
+            if let Some(counts) = &mut self.field_counts {
+                if counts.len() == self.num_rows {
+                    counts.push(self.num_columns);
+                } else {
+                    counts[self.num_rows] = self.num_columns;
+                }
+            }
+            if let Some(quoted) = &mut self.quoted_empty {
+                quoted.record(self.num_rows, self.num_columns, 1, false, raw)?;
+            }
+            self.num_rows += 1;
+        }
+        if !skipped {
+            *read += 1;
+        }
+        self.line_number = line_number.saturating_add(1);
+        self.record_data_start = self.data_len;
+        self.record_offsets_start = self.offsets_len;
+        Ok(())
+    }
+
     #[inline(always)]
-    fn consume_one_column_blank_prefix(
+    fn consume_blank_prefix(
         &mut self,
         input: &[u8],
         input_offset: &mut usize,
@@ -699,6 +895,58 @@ impl RecordDecoder {
         if self.current_field != 0 || !self.record_bytes.is_empty() {
             return Ok(false);
         }
+        if let Some(PendingCr::MaterializedBlank {
+            line_number,
+            source_line_number,
+            byte_offset,
+        }) = self.pending_cr
+        {
+            if *input_offset == input.len() && !input.is_empty() {
+                return Ok(false);
+            }
+            let with_lf = self.terminator.is_none() && input.get(*input_offset) == Some(&b'\n');
+            if with_lf && self.max_record_bytes.is_some_and(|limit| limit < 2) {
+                return Err(ArrowError::CsvError(
+                    "CSV record exceeds the configured 1 byte limit".to_owned(),
+                ));
+            }
+            let raw = if with_lf {
+                b"\r\n".as_slice()
+            } else {
+                b"\r".as_slice()
+            };
+            self.pending_cr = None;
+            self.materialize_blank_record(
+                handler,
+                raw,
+                line_number,
+                source_line_number,
+                byte_offset,
+                read,
+            )?;
+            if with_lf {
+                let mut discarded_data = [0_u8; 1];
+                let mut discarded_offsets = [0_usize; 1];
+                let (_, consumed, _, _) = self.delimiter.read_record(
+                    &input[*input_offset..*input_offset + 1],
+                    &mut discarded_data,
+                    &mut discarded_offsets,
+                );
+                if consumed != 1 {
+                    return Err(ArrowError::CsvError(
+                        "CSV blank record CRLF continuation was not consumed".to_owned(),
+                    ));
+                }
+                *input_offset += 1;
+                self.stream_offset = self.stream_offset.checked_add(1).ok_or_else(|| {
+                    ArrowError::CsvError("CSV input byte offset overflowed".into())
+                })?;
+                self.record_byte_offset = self.stream_offset;
+                source_lines.advance(&input[*counted_until..*input_offset]);
+                *counted_until = *input_offset;
+            }
+            return Ok(true);
+        }
         let Some(&byte) = input.get(*input_offset) else {
             return Ok(false);
         };
@@ -709,7 +957,9 @@ impl RecordDecoder {
         }
         let continuation = matches!(self.pending_cr, Some(PendingCr::Data)) && byte == b'\n';
         self.pending_cr = None;
-        if self.stream_offset == 0 && input[*input_offset..].starts_with(b"\xef\xbb\xbf") {
+        if self.stream_offset == self.initial_stream_offset
+            && input[*input_offset..].starts_with(b"\xef\xbb\xbf")
+        {
             return Ok(false);
         }
 
@@ -743,54 +993,7 @@ impl RecordDecoder {
                 "CSV blank record terminator was not consumed".to_owned(),
             ));
         }
-
-        if blank {
-            let skipped =
-                if !self.skipping_records && self.filter_records && handler.has_record_error(raw) {
-                    source_lines.advance(&input[*counted_until..*input_offset + 1]);
-                    *counted_until = *input_offset + 1;
-                    handler.skip_record(&CsvFilterRecord {
-                        line_number: self.line_number,
-                        source_line_number: source_lines.record_start_line(
-                            usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
-                            raw,
-                        ),
-                        byte_offset: self.stream_offset,
-                        record: raw,
-                    })?
-                } else {
-                    false
-                };
-            if !self.skipping_records && !skipped {
-                handler.handle_record(&CsvRecord {
-                    line_number: self.line_number,
-                    byte_offset: self.stream_offset,
-                    record: raw,
-                })?;
-                self.offsets[self.offsets_len] = 0;
-                self.offsets_len += 1;
-                if let Some(counts) = &mut self.field_counts {
-                    if counts.len() == self.num_rows {
-                        counts.push(1);
-                    } else {
-                        counts[self.num_rows] = 1;
-                    }
-                }
-                if let Some(quoted) = &mut self.quoted_empty {
-                    quoted.record(self.num_rows, 1, 1, false, raw)?;
-                }
-                self.num_rows += 1;
-            }
-            if !skipped {
-                *read += 1;
-            }
-            self.line_number += 1;
-            self.record_data_start = self.data_len;
-            self.record_offsets_start = self.offsets_len;
-            self.pending_cr =
-                (self.terminator.is_none() && byte == b'\r').then_some(PendingCr::Data);
-        }
-
+        let byte_offset = self.stream_offset;
         *input_offset += 1;
         self.stream_offset = self
             .stream_offset
@@ -799,6 +1002,28 @@ impl RecordDecoder {
         self.record_byte_offset = self.stream_offset;
         source_lines.advance(&input[*counted_until..*input_offset]);
         *counted_until = *input_offset;
+        if blank {
+            let source_line_number = source_lines.record_start_line(
+                usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
+                raw,
+            );
+            if self.terminator.is_none() && byte == b'\r' {
+                self.pending_cr = Some(PendingCr::MaterializedBlank {
+                    line_number: self.line_number,
+                    source_line_number,
+                    byte_offset,
+                });
+            } else {
+                self.materialize_blank_record(
+                    handler,
+                    raw,
+                    self.line_number,
+                    source_line_number,
+                    byte_offset,
+                    read,
+                )?;
+            }
+        }
         Ok(true)
     }
 
@@ -819,7 +1044,8 @@ impl RecordDecoder {
             if self.current_field != 0
                 || !self.record_bytes.is_empty()
                 || input.get(*input_offset) != Some(&comment)
-                || (self.stream_offset == 0 && input[*input_offset..].starts_with(b"\xef\xbb\xbf"))
+                || (self.stream_offset == self.initial_stream_offset
+                    && input[*input_offset..].starts_with(b"\xef\xbb\xbf"))
             {
                 return Ok(false);
             }
@@ -857,8 +1083,11 @@ impl RecordDecoder {
         Ok(true)
     }
 
-    fn input_may_have_one_column_blank(&self, input: &[u8], to_read: usize) -> bool {
+    fn input_may_have_blank(&self, input: &[u8], to_read: usize) -> bool {
         const MAX_PREFLIGHT_BYTES_PER_ROW: usize = 64;
+        if matches!(self.pending_cr, Some(PendingCr::MaterializedBlank { .. })) {
+            return true;
+        }
         if self.skipping_custom_comment {
             return true;
         }
@@ -888,7 +1117,180 @@ impl RecordDecoder {
         }
     }
 
-    fn decode_strict<const IGNORE_EXTRA: bool>(
+    fn advance_strict_position(&mut self, input: &[u8]) -> Result<(), ArrowError> {
+        self.source_lines.advance(input);
+        self.stream_offset = self
+            .stream_offset
+            .checked_add(input.len())
+            .ok_or_else(|| ArrowError::CsvError("CSV input byte offset overflowed".into()))?;
+        Ok(())
+    }
+
+    fn advance_strict_position_fast(
+        &mut self,
+        input: &[u8],
+        bare_cr: bool,
+    ) -> Result<(), ArrowError> {
+        if self.blank_record_policy == CsvBlankRecordPolicy::Reject {
+            if bare_cr || self.terminator.is_some() {
+                return self.advance_strict_position(input);
+            }
+            if let Some(&first) = input.first() {
+                if self.source_lines.pending_cr && first != b'\n' {
+                    self.source_lines.bare_cr_count =
+                        self.source_lines.bare_cr_count.saturating_add(1);
+                }
+                self.source_lines.pending_cr = input.last() == Some(&b'\r');
+            }
+        }
+        self.stream_offset = self
+            .stream_offset
+            .checked_add(input.len())
+            .ok_or_else(|| ArrowError::CsvError("CSV input byte offset overflowed".into()))?;
+        Ok(())
+    }
+
+    fn finish_strict<const TRACK_BLANK: bool>(
+        &mut self,
+        input: &[u8],
+        read: usize,
+        consumed: usize,
+    ) -> Result<(usize, usize), ArrowError> {
+        if TRACK_BLANK {
+            self.advance_strict_position(&input[..consumed])?;
+        }
+        Ok((read, consumed))
+    }
+
+    fn consume_strict_ignored(&mut self, input: &[u8]) -> Result<(), ArrowError> {
+        let mut discarded_data = [0_u8; 1];
+        let mut discarded_offsets = [0_usize; 1];
+        let (result, bytes, _, ends) =
+            self.delimiter
+                .read_record(input, &mut discarded_data, &mut discarded_offsets);
+        if bytes != input.len() || ends != 0 || matches!(result, ReadRecordResult::Record) {
+            return Err(ArrowError::CsvError(
+                "CSV blank record terminator was not consumed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn handle_strict_blank(
+        &mut self,
+        raw: &[u8],
+        input_prefix: &[u8],
+        read: &mut usize,
+    ) -> Result<(), ArrowError> {
+        match self.blank_record_policy {
+            CsvBlankRecordPolicy::Ignore => unreachable!(),
+            CsvBlankRecordPolicy::Reject => {
+                let mut source_lines = self.source_lines;
+                source_lines.advance(input_prefix);
+                let source_line = source_lines.record_start_line(
+                    usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
+                    raw,
+                );
+                return Err(ArrowError::CsvError(format!(
+                    "blank CSV record at line {}, source line {source_line}",
+                    self.line_number,
+                )));
+            }
+            CsvBlankRecordPolicy::EmitNullRow => {
+                if !self.blank_null_row_supported {
+                    return Err(ArrowError::CsvError(
+                        "CSV blank records as NULL rows require all columns to be nullable"
+                            .to_owned(),
+                    ));
+                }
+                self.offsets[self.offsets_len..self.offsets_len + self.num_columns].fill(0);
+                self.offsets_len += self.num_columns;
+                let counts = self
+                    .field_counts
+                    .as_mut()
+                    .expect("initialized for NULL rows");
+                if counts.len() == self.num_rows {
+                    counts.push(0);
+                } else {
+                    counts[self.num_rows] = 0;
+                }
+                if let Some(quoted) = &mut self.quoted_empty {
+                    let end = self.offsets_len - 1;
+                    quoted.fields.resize(end, 0);
+                    quoted.fields[end - self.num_columns..end].fill(0);
+                }
+                self.num_rows += 1;
+                *read += 1;
+            }
+            CsvBlankRecordPolicy::Skip => {
+                if !self.skipping_records {
+                    if let Some(counter) = &self.skipped_blank_records_counter {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        self.line_number = self.line_number.saturating_add(1);
+        self.strict_at_record_start = true;
+        self.strict_pending_cr = self.terminator.is_none() && raw == b"\r";
+        self.record_data_start = self.data_len;
+        self.record_offsets_start = self.offsets_len;
+        Ok(())
+    }
+
+    fn strict_fast_input_bare_cr(&self, input: &[u8], to_read: usize) -> Option<bool> {
+        const MAX_PREFLIGHT_BYTES_PER_ROW: usize = 64;
+        if self.comment.is_some()
+            || self.strict_comment
+            || self.strict_bom_len != 0
+            || self.quoted_empty.is_some()
+            || self.stream_offset == self.initial_stream_offset
+            || input.len() > to_read.saturating_mul(MAX_PREFLIGHT_BYTES_PER_ROW)
+        {
+            return None;
+        }
+
+        let prefix = usize::from(self.strict_pending_cr && input.first() == Some(&b'\n'));
+        if self.strict_at_record_start
+            && input
+                .get(prefix)
+                .is_some_and(|byte| is_record_terminator(*byte, self.terminator))
+        {
+            return None;
+        }
+
+        if let Some(term) = self.terminator {
+            memchr::memmem::find(input, &[term, term])
+                .is_none()
+                .then_some(true)
+        } else {
+            let (blank, bare_cr) = scan_record_terminators(input);
+            (!blank).then_some(bare_cr)
+        }
+    }
+
+    fn decode_strict_blank<const IGNORE_EXTRA: bool>(
+        &mut self,
+        input: &[u8],
+        to_read: usize,
+    ) -> Result<(usize, usize), ArrowError> {
+        let fast_bare_cr = self.strict_fast_input_bare_cr(input, to_read);
+        if let Some(bare_cr) = fast_bare_cr {
+            let (rows, bytes) =
+                self.decode_strict::<IGNORE_EXTRA, false, false, true>(input, to_read)?;
+            self.advance_strict_position_fast(&input[..bytes], bare_cr)?;
+            Ok((rows, bytes))
+        } else {
+            self.decode_strict::<IGNORE_EXTRA, true, true, false>(input, to_read)
+        }
+    }
+
+    fn decode_strict<
+        const IGNORE_EXTRA: bool,
+        const TRACK_BLANK: bool,
+        const CHECK_BLANK: bool,
+        const CAPTURE_STATE: bool,
+    >(
         &mut self,
         input: &[u8],
         to_read: usize,
@@ -901,10 +1303,26 @@ impl RecordDecoder {
                 "CSV cannot ignore extra fields with an empty schema".to_owned(),
             ));
         }
+        if TRACK_BLANK && input.is_empty() && self.strict_bom_len != 0 {
+            let prefix_len = self.strict_bom_len;
+            self.strict_bom_len = 0;
+            let (rows, bytes) = self.decode_strict::<IGNORE_EXTRA, false, false, false>(
+                &b"\xef\xbb\xbf"[..prefix_len],
+                to_read,
+            )?;
+            debug_assert_eq!((rows, bytes), (0, prefix_len));
+            self.strict_at_record_start = false;
+        }
 
-        // Reserve sufficient capacity in offsets
+        // Opt-in input cannot contain more records than bytes. The default
+        // reservation remains unchanged for ordinary scans.
+        let reserve_rows = if TRACK_BLANK {
+            to_read.min(input.len().saturating_add(1))
+        } else {
+            to_read
+        };
         self.offsets
-            .resize(self.offsets_len + to_read * self.num_columns, 0);
+            .resize(self.offsets_len + reserve_rows * self.num_columns, 0);
 
         // The current offset into `input`
         let mut input_offset = 0;
@@ -912,25 +1330,138 @@ impl RecordDecoder {
 
         // The number of rows decoded in this pass
         let mut read = 0;
+        let mut fast_boundary_offset = 0;
+        let mut fast_at_boundary = self.strict_at_record_start;
+        let mut fast_boundary_cr = self.strict_pending_cr;
 
         loop {
             // Reserve necessary space in output data based on best estimate
             let remaining_rows = to_read - read;
             let capacity = remaining_rows * self.num_columns * AVERAGE_FIELD_SIZE;
-            let estimated_data = capacity.max(MIN_CAPACITY);
+            let estimated_data = if TRACK_BLANK {
+                capacity.min(input.len() - input_offset).max(64)
+            } else {
+                capacity.max(MIN_CAPACITY)
+            };
             self.data.resize(self.data_len + estimated_data, 0);
 
             // Try to read a record
             loop {
+                let mut continuing_crlf = false;
+                if CHECK_BLANK && !input.is_empty() {
+                    if input_offset == input.len() {
+                        return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
+                    }
+                    let mut remaining = &input[input_offset..];
+                    if self.strict_bom_len != 0
+                        || (self.stream_offset == self.initial_stream_offset && input_offset == 0)
+                    {
+                        const BOM: &[u8; 3] = b"\xef\xbb\xbf";
+                        while self.strict_bom_len < 3
+                            && input.get(input_offset) == Some(&BOM[self.strict_bom_len])
+                        {
+                            self.strict_bom_len += 1;
+                            input_offset += 1;
+                        }
+                        if self.strict_bom_len == 3 {
+                            record_start = input_offset;
+                            if input_offset == input.len() {
+                                return self.finish_strict::<TRACK_BLANK>(
+                                    input,
+                                    read,
+                                    input_offset,
+                                );
+                            }
+                            remaining = &input[input_offset..];
+                        }
+                        if self.strict_bom_len != 0 && self.strict_bom_len != 3 {
+                            if input_offset == input.len() {
+                                return self.finish_strict::<TRACK_BLANK>(
+                                    input,
+                                    read,
+                                    input_offset,
+                                );
+                            }
+                            let prefix_len = self.strict_bom_len;
+                            self.strict_bom_len = 0;
+                            let (rows, bytes) = self
+                                .decode_strict::<IGNORE_EXTRA, false, false, false>(
+                                    &BOM[..prefix_len],
+                                    to_read - read,
+                                )?;
+                            debug_assert_eq!((rows, bytes), (0, prefix_len));
+                            self.strict_at_record_start = false;
+                            record_start = input_offset;
+                            continue;
+                        }
+                    }
+                    if self.strict_bom_len != 3 && self.strict_pending_cr {
+                        self.strict_pending_cr = false;
+                        if remaining[0] == b'\n' {
+                            if remaining.len() == 1
+                                || is_record_terminator(remaining[1], self.terminator)
+                                || is_comment_start(remaining[1], self.comment, self.terminator)
+                            {
+                                self.consume_strict_ignored(&remaining[..1])?;
+                                input_offset += 1;
+                                record_start = input_offset;
+                                continue;
+                            }
+                            continuing_crlf = true;
+                            record_start = input_offset + 1;
+                        }
+                    }
+                    if self.strict_bom_len != 3
+                        && self.strict_at_record_start
+                        && !self.strict_comment
+                        && !continuing_crlf
+                    {
+                        if is_comment_start(remaining[0], self.comment, self.terminator) {
+                            self.strict_comment = true;
+                        } else if is_record_terminator(remaining[0], self.terminator) {
+                            let blank_len =
+                                if self.terminator.is_none() && remaining.starts_with(b"\r\n") {
+                                    2
+                                } else {
+                                    1
+                                };
+                            let raw = &remaining[..blank_len];
+                            self.consume_strict_ignored(raw)?;
+                            input_offset += blank_len;
+                            self.handle_strict_blank(raw, &input[..input_offset], &mut read)?;
+                            record_start = input_offset;
+                            if read == to_read {
+                                return self.finish_strict::<TRACK_BLANK>(
+                                    input,
+                                    read,
+                                    input_offset,
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let skipping_extra_fields = IGNORE_EXTRA && self.skipping_extra_fields;
+                let mut bom_prefix = [0xef, 0xbb, 0xbf, 0];
+                let feeding_bom = CHECK_BLANK && self.strict_bom_len == 3 && !input.is_empty();
+                let scan_input = if feeding_bom {
+                    // csv_core must consume the first BOM so it retains a later BOM as data.
+                    bom_prefix[3] = input[input_offset];
+                    &bom_prefix[..]
+                } else if TRACK_BLANK && self.strict_comment {
+                    let remaining = &input[input_offset..];
+                    let end =
+                        memchr::memchr(b'\n', remaining).map_or(remaining.len(), |index| index + 1);
+                    &remaining[..end]
+                } else {
+                    &input[input_offset..]
+                };
+                let input_before_read = input_offset;
                 let (result, bytes_read, bytes_written, end_positions) = if skipping_extra_fields {
                     let mut skipped_data = [0_u8; 1024];
                     let mut skipped_offsets = [0_usize; 16];
-                    self.delimiter.read_record(
-                        &input[input_offset..],
-                        &mut skipped_data,
-                        &mut skipped_offsets,
-                    )
+                    self.delimiter
+                        .read_record(scan_input, &mut skipped_data, &mut skipped_offsets)
                 } else {
                     let offsets_end = if IGNORE_EXTRA {
                         self.record_offsets_start + self.num_columns
@@ -938,13 +1469,60 @@ impl RecordDecoder {
                         self.offsets.len()
                     };
                     self.delimiter.read_record(
-                        &input[input_offset..],
+                        scan_input,
                         &mut self.data[self.data_len..],
                         &mut self.offsets[self.offsets_len..offsets_end],
                     )
                 };
                 self.current_field += end_positions;
-                input_offset += bytes_read;
+                let input_bytes_read = if feeding_bom {
+                    self.strict_bom_len = 0;
+                    debug_assert!(bytes_read >= 3);
+                    bytes_read - 3
+                } else {
+                    bytes_read
+                };
+                input_offset += input_bytes_read;
+                if continuing_crlf {
+                    if input_bytes_read == 0 {
+                        record_start = input_before_read;
+                        self.strict_pending_cr = true;
+                    } else if input_bytes_read == 1 {
+                        record_start = input_offset;
+                        self.strict_at_record_start = true;
+                    }
+                }
+                if TRACK_BLANK && input_bytes_read != 0 {
+                    if feeding_bom
+                        && self.strict_at_record_start
+                        && !self.strict_comment
+                        && is_comment_start(input[input_before_read], self.comment, self.terminator)
+                    {
+                        self.strict_comment = true;
+                    }
+                    if self.strict_comment {
+                        if memchr::memchr(b'\n', &input[input_before_read..input_offset]).is_some()
+                        {
+                            self.strict_comment = false;
+                            self.strict_at_record_start = true;
+                        }
+                    } else {
+                        if !continuing_crlf || input_bytes_read > 1 {
+                            self.strict_at_record_start = false;
+                        }
+                    }
+                }
+                if feeding_bom && input_bytes_read != 0 {
+                    let first = input[input_before_read];
+                    if is_record_terminator(first, self.terminator) {
+                        let raw = &input[input_before_read..input_offset];
+                        self.handle_strict_blank(raw, &input[..input_offset], &mut read)?;
+                        record_start = input_offset;
+                        if read == to_read {
+                            return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
+                        }
+                    }
+                }
                 if skipping_extra_fields {
                     if self.quoted_empty.is_some() {
                         self.record_bytes
@@ -958,12 +1536,29 @@ impl RecordDecoder {
 
                 match result {
                     ReadRecordResult::End | ReadRecordResult::InputEmpty => {
+                        if TRACK_BLANK && input_offset < input.len() {
+                            if self.quoted_empty.is_some() {
+                                self.record_bytes
+                                    .extend_from_slice(&input[record_start..input_offset]);
+                                record_start = input_offset;
+                            }
+                            continue;
+                        }
+                        if CAPTURE_STATE {
+                            let untouched = input_offset == fast_boundary_offset;
+                            let crlf_continuation = fast_boundary_cr
+                                && input.get(fast_boundary_offset) == Some(&b'\n')
+                                && input_offset == fast_boundary_offset + 1;
+                            self.strict_at_record_start =
+                                (untouched && fast_at_boundary) || crlf_continuation;
+                            self.strict_pending_cr = untouched && fast_boundary_cr;
+                        }
                         // Reached end of input
                         if self.quoted_empty.is_some() {
                             self.record_bytes
                                 .extend_from_slice(&input[record_start..input_offset]);
                         }
-                        return Ok((read, input_offset));
+                        return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
                     }
                     // Need to allocate more capacity
                     ReadRecordResult::OutputFull => {
@@ -994,6 +1589,17 @@ impl RecordDecoder {
                         )));
                     }
                     ReadRecordResult::Record => {
+                        if CAPTURE_STATE {
+                            fast_boundary_offset = input_offset;
+                            fast_at_boundary = true;
+                            fast_boundary_cr = self.terminator.is_none()
+                                && input.get(input_offset.saturating_sub(1)) == Some(&b'\r');
+                        }
+                        if TRACK_BLANK {
+                            self.strict_at_record_start = true;
+                            self.strict_pending_cr = self.terminator.is_none()
+                                && input.get(input_offset.saturating_sub(1)) == Some(&b'\r');
+                        }
                         self.skipping_extra_fields = false;
                         if self.current_field != self.num_columns
                             && !(IGNORE_EXTRA && self.current_field > self.num_columns)
@@ -1058,14 +1664,22 @@ impl RecordDecoder {
 
                         if read == to_read {
                             // Read sufficient rows
-                            return Ok((read, input_offset));
+                            if CAPTURE_STATE {
+                                self.strict_at_record_start = true;
+                                self.strict_pending_cr = fast_boundary_cr;
+                            }
+                            return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
                         }
 
                         if input.len() == input_offset {
                             // Input exhausted, need to read more
                             // Without this read_record will interpret the empty input
                             // byte array as indicating the end of the file
-                            return Ok((read, input_offset));
+                            if CAPTURE_STATE {
+                                self.strict_at_record_start = true;
+                                self.strict_pending_cr = fast_boundary_cr;
+                            }
+                            return self.finish_strict::<TRACK_BLANK>(input, read, input_offset);
                         }
                     }
                 }
@@ -1087,9 +1701,9 @@ impl RecordDecoder {
                 "CSV cannot ignore extra fields with an empty schema".to_owned(),
             ));
         }
-        if BLANK_AS_ROW && self.num_columns != 1 {
+        if BLANK_AS_ROW && self.num_columns == 0 {
             return Err(ArrowError::CsvError(
-                "CSV blank records can be rows only with a one-column schema".to_owned(),
+                "CSV blank records as rows require at least one column".to_owned(),
             ));
         }
 
@@ -1129,7 +1743,7 @@ impl RecordDecoder {
                     continue;
                 }
                 if BLANK_AS_ROW
-                    && self.consume_one_column_blank_prefix(
+                    && self.consume_blank_prefix(
                         input,
                         &mut input_offset,
                         &mut counted_until,
@@ -1164,12 +1778,12 @@ impl RecordDecoder {
                 };
                 let record_input_start = input_offset;
                 let remaining_input = &input[input_offset..];
-                let initial_bom =
-                    self.stream_offset == 0 && remaining_input.starts_with(b"\xef\xbb\xbf");
+                let initial_bom = self.stream_offset == self.initial_stream_offset
+                    && remaining_input.starts_with(b"\xef\xbb\xbf");
                 let scan_input = if BLANK_AS_ROW && initial_bom {
                     &remaining_input[..3]
                 } else if self.blank_records_are_rows
-                    && self.stream_offset > 0
+                    && self.stream_offset > self.initial_stream_offset
                     && remaining_input.starts_with(b"\xef\xbb\xbf")
                 {
                     &remaining_input[..1]
@@ -1485,11 +2099,24 @@ impl RecordDecoder {
                             }
                         }
 
-                        handler.handle_record(&CsvRecord {
+                        let record = CsvRecord {
                             line_number: self.line_number,
                             byte_offset: self.record_byte_offset,
                             record: &self.record_bytes,
-                        })?;
+                        };
+                        if self.record_source_lines {
+                            source_lines.advance(&input[counted_until..input_offset]);
+                            counted_until = input_offset;
+                            handler.handle_record_with_source_line(
+                                &record,
+                                source_lines.record_start_line(
+                                    usize::try_from(self.delimiter.line()).unwrap_or(usize::MAX),
+                                    &self.record_bytes,
+                                ),
+                            )?;
+                        } else {
+                            handler.handle_record(&record)?;
+                        }
 
                         if self.current_field < self.num_columns {
                             let fill_count = self.num_columns - self.current_field;
@@ -1805,7 +2432,76 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use super::{MAX_RECOVERABLE_EXCESS_FIELDS, RecordDecoder, recovery_limit_error};
+    use super::{
+        MAX_RECOVERABLE_EXCESS_FIELDS, RecordDecoder, recovery_limit_error, scan_record_terminators,
+    };
+
+    #[test]
+    fn test_strict_blank_vector_preflight_across_boundaries() {
+        for len in 0usize..=34 {
+            for index in 0..len.saturating_sub(1) {
+                for &first in b"x\r\n" {
+                    for &second in b"x\r\n" {
+                        let mut input = vec![b'x'; len];
+                        input[index] = first;
+                        input[index + 1] = second;
+                        let expected = input.windows(2).any(|pair| {
+                            (pair[0] == b'\r' || pair[0] == b'\n')
+                                && (pair[1] == b'\r' || pair[1] == b'\n')
+                                && pair != b"\r\n"
+                        });
+                        let bare_cr = input
+                            .windows(2)
+                            .any(|pair| pair[0] == b'\r' && pair[1] != b'\n');
+                        let actual = scan_record_terminators(&input);
+                        assert_eq!(
+                            actual.0, expected,
+                            "len={len}, index={index}, bytes={input:?}"
+                        );
+                        if !expected {
+                            assert_eq!(
+                                actual.1, bare_cr,
+                                "len={len}, index={index}, bytes={input:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_preflight_crlf_boundaries() {
+        let mut decoder = RecordDecoder::new(Reader::new(), 1, false);
+        decoder.stream_offset = 1;
+        assert_eq!(
+            decoder.strict_fast_input_bare_cr(b"one\r\ntwo\r\n", 100),
+            Some(false)
+        );
+        assert!(
+            decoder
+                .strict_fast_input_bare_cr(b"one\r\n\r\ntwo", 100)
+                .is_none()
+        );
+        assert!(
+            decoder
+                .strict_fast_input_bare_cr(b"one\n\ntwo", 100)
+                .is_none()
+        );
+
+        decoder.strict_pending_cr = true;
+        assert_eq!(decoder.strict_fast_input_bare_cr(b"\n", 100), Some(false));
+        assert_eq!(
+            decoder.strict_fast_input_bare_cr(b"\ntwo\r\n", 100),
+            Some(false)
+        );
+        assert!(
+            decoder
+                .strict_fast_input_bare_cr(b"\n\r\ntwo", 100)
+                .is_none()
+        );
+        assert!(decoder.strict_fast_input_bare_cr(b"\n\ntwo", 100).is_none());
+    }
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct OwnedRecordError {
@@ -1841,6 +2537,14 @@ mod tests {
         record: Vec<u8>,
     }
 
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    struct OwnedSourceRecord {
+        line_number: usize,
+        source_line_number: usize,
+        byte_offset: usize,
+        record: Vec<u8>,
+    }
+
     #[derive(Debug, Default)]
     struct CollectRecords {
         errors: Mutex<Vec<OwnedRecordError>>,
@@ -1850,6 +2554,32 @@ mod tests {
         report_blanks: bool,
         materialize_blanks: bool,
         max_record_bytes: Option<usize>,
+    }
+
+    #[derive(Debug, Default)]
+    struct SourceLines(Mutex<Vec<(usize, usize, usize)>>);
+
+    impl CsvRecordErrorHandler for SourceLines {
+        fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            Ok(())
+        }
+
+        fn needs_source_line_number(&self) -> bool {
+            true
+        }
+
+        fn handle_record_with_source_line(
+            &self,
+            record: &CsvRecord<'_>,
+            source_line_number: usize,
+        ) -> Result<(), ArrowError> {
+            self.0.lock().unwrap().push((
+                record.line_number,
+                source_line_number,
+                record.byte_offset,
+            ));
+            Ok(())
+        }
     }
 
     impl CsvRecordErrorHandler for CollectRecords {
@@ -2038,12 +2768,17 @@ mod tests {
 
     #[test]
     fn test_one_column_blank_records_are_rows_across_batches_and_chunks() {
-        for (csv, expected, blank_offset) in [
-            (b"a\n\nb\n".as_slice(), ["a", "", "b"], 2),
-            (b"a\n\nb".as_slice(), ["a", "", "b"], 2),
-            (b"a\r\n\r\nb\r\n".as_slice(), ["a", "", "b"], 3),
-            (b"\n\n\n".as_slice(), ["", "", ""], 1),
-            (b"a\r\rb\r".as_slice(), ["a", "", "b"], 2),
+        for (csv, expected, blank_offset, blank_raw) in [
+            (b"a\n\nb\n".as_slice(), ["a", "", "b"], 2, b"\n".as_slice()),
+            (b"a\n\nb".as_slice(), ["a", "", "b"], 2, b"\n".as_slice()),
+            (
+                b"a\r\n\r\nb\r\n".as_slice(),
+                ["a", "", "b"],
+                3,
+                b"\r\n".as_slice(),
+            ),
+            (b"\n\n\n".as_slice(), ["", "", ""], 1, b"\n".as_slice()),
+            (b"a\r\rb\r".as_slice(), ["a", "", "b"], 2, b"\r".as_slice()),
         ] {
             for capacity in [1, 2, 5, 64] {
                 for batch_size in [1, 2, 8] {
@@ -2057,7 +2792,9 @@ mod tests {
                     let mut actual = Vec::new();
                     loop {
                         let buf = reader.fill_buf().unwrap();
-                        let (_, bytes) = decoder.decode(buf, batch_size - decoder.len()).unwrap();
+                        let input_empty = buf.is_empty();
+                        let (decoded, bytes) =
+                            decoder.decode(buf, batch_size - decoder.len()).unwrap();
                         reader.consume(bytes);
                         if decoder.len() == batch_size || bytes == 0 {
                             actual.extend(
@@ -2068,9 +2805,10 @@ mod tests {
                                     .map(|record| record.get(0).to_owned()),
                             );
                         }
-                        if bytes == 0 {
+                        if bytes == 0 && input_empty {
                             break;
                         }
+                        assert!(bytes > 0 || decoded > 0);
                     }
                     assert_eq!(actual, expected, "capacity={capacity}, batch={batch_size}");
                     assert!(handler.blanks.lock().unwrap().is_empty());
@@ -2079,21 +2817,64 @@ mod tests {
                     assert_eq!(records.len(), 3);
                     assert_eq!(records[1].line_number, 2);
                     assert_eq!(records[1].byte_offset, blank_offset);
+                    assert_eq!(records[1].record, blank_raw);
                 }
             }
         }
     }
 
     #[test]
-    fn test_blank_records_as_rows_requires_one_column() {
+    fn test_blank_records_as_rows_with_multiple_columns() {
+        for csv in [b"1,2\n\n3,4\n".as_slice(), b"1,2\r\n\r\n3,4\r\n".as_slice()] {
+            for capacity in [1, 2, 5, 64] {
+                for batch_size in [1, 2, 8] {
+                    let handler = Arc::new(CollectRecords {
+                        materialize_blanks: true,
+                        ..Default::default()
+                    });
+                    let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                        .with_record_error_handler(Some(handler.clone()));
+                    let mut reader = BufReader::with_capacity(capacity, Cursor::new(csv));
+                    let mut actual = Vec::new();
+                    loop {
+                        let buf = reader.fill_buf().unwrap();
+                        let (_, bytes) = decoder.decode(buf, batch_size - decoder.len()).unwrap();
+                        reader.consume(bytes);
+                        if decoder.len() == batch_size || bytes == 0 {
+                            actual.extend(decoder.flush().unwrap().iter().map(|record| {
+                                (record.get(0).to_owned(), record.get(1).to_owned())
+                            }));
+                        }
+                        if bytes == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        actual,
+                        [
+                            ("1".into(), "2".into()),
+                            ("".into(), "".into()),
+                            ("3".into(), "4".into())
+                        ],
+                        "capacity={capacity}, batch={batch_size}"
+                    );
+                    assert!(handler.blanks.lock().unwrap().is_empty());
+                    assert!(handler.errors.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_blank_records_as_rows_requires_nonempty_schema() {
         let handler = Arc::new(CollectRecords {
             materialize_blanks: true,
             ..Default::default()
         });
         let mut decoder =
-            RecordDecoder::new(Reader::new(), 2, false).with_record_error_handler(Some(handler));
+            RecordDecoder::new(Reader::new(), 0, false).with_record_error_handler(Some(handler));
         let error = decoder.decode(b"\n", 1).unwrap_err();
-        assert!(error.to_string().contains("one-column schema"));
+        assert!(error.to_string().contains("at least one column"));
     }
 
     #[test]
@@ -2450,6 +3231,34 @@ mod tests {
     }
 
     #[test]
+    fn test_positioned_one_column_bom_with_and_without_blank_header() {
+        let handler = Arc::new(CollectRecords {
+            materialize_blanks: true,
+            ..Default::default()
+        });
+        let mut decoder = RecordDecoder::new(Reader::new(), 1, false)
+            .with_initial_source_position(2, 11)
+            .with_record_error_handler(Some(handler));
+        let csv = b"\xef\xbb\xbfvalue\n";
+        assert_eq!(decoder.decode(csv, 1).unwrap(), (1, csv.len()));
+        assert_eq!(decoder.flush().unwrap().get(0).get(0), "value");
+
+        let handler = Arc::new(CollectRecords {
+            materialize_blanks: true,
+            ..Default::default()
+        });
+        let mut decoder = RecordDecoder::new(Reader::new(), 1, false)
+            .with_initial_source_position(2, 11)
+            .with_record_error_handler(Some(handler));
+        let csv = b"\xef\xbb\xbf\nvalue\n";
+        assert_eq!(decoder.decode_validating_header(csv).unwrap(), (0, 3));
+        assert_eq!(decoder.decode_validating_header(&csv[3..]).unwrap(), (1, 1));
+        assert_eq!(decoder.flush().unwrap().get(0).get(0), "");
+        assert_eq!(decoder.decode(&csv[4..], 1).unwrap(), (1, 6));
+        assert_eq!(decoder.flush().unwrap().get(0).get(0), "value");
+    }
+
+    #[test]
     fn test_one_column_blank_record_respects_filter() {
         #[derive(Debug)]
         struct SkipBlank;
@@ -2525,6 +3334,137 @@ mod tests {
             assert_eq!(errors[0].line_number, 4);
             assert_eq!(errors[0].source_line_number, 5);
             assert_eq!(errors[0].byte_offset, first.len() + 4);
+        }
+    }
+
+    #[test]
+    fn test_recovery_reports_lf_blank_after_split_crlf_data_row() {
+        let csv = b"1,ok\r\n\n2,bad,extra\n";
+        for capacity in [1, 2, 64] {
+            let handler = Arc::new(CollectRecords {
+                report_blanks: true,
+                ..Default::default()
+            });
+            let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                .with_record_error_handler(Some(handler.clone()));
+            let mut reader = BufReader::with_capacity(capacity, Cursor::new(csv));
+            loop {
+                let buf = reader.fill_buf().unwrap();
+                let (_, bytes) = decoder.decode(buf, 10 - decoder.len()).unwrap();
+                reader.consume(bytes);
+                if bytes == 0 {
+                    break;
+                }
+            }
+            assert_eq!(
+                *handler.blanks.lock().unwrap(),
+                [OwnedBlankRecord {
+                    line_number: 2,
+                    source_line_number: 2,
+                    byte_offset: 6,
+                    record: b"\n".to_vec(),
+                }],
+                "capacity={capacity}"
+            );
+            let errors = handler.errors.lock().unwrap();
+            assert_eq!(errors[0].line_number, 3);
+            assert_eq!(errors[0].source_line_number, 3);
+            assert_eq!(errors[0].byte_offset, 7);
+        }
+    }
+
+    #[test]
+    fn test_blank_record_source_position_after_skipped_prefix() {
+        let handler = Arc::new(CollectRecords {
+            report_blanks: true,
+            ..Default::default()
+        });
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_initial_source_position(2, 11)
+            .with_record_error_handler(Some(handler.clone()));
+        let csv = b"\r\n1,ok\r\n";
+        assert_eq!(decoder.decode(csv, 2).unwrap(), (1, csv.len()));
+        assert_eq!(
+            *handler.blanks.lock().unwrap(),
+            [OwnedBlankRecord {
+                line_number: 1,
+                source_line_number: 3,
+                byte_offset: 11,
+                record: b"\r\n".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_materialized_blank_record_has_source_line_after_skipped_prefix() {
+        #[derive(Debug, Default)]
+        struct MaterializedSourceLines(Mutex<Vec<OwnedSourceRecord>>);
+
+        impl CsvRecordErrorHandler for MaterializedSourceLines {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                true
+            }
+
+            fn needs_source_line_number(&self) -> bool {
+                true
+            }
+
+            fn handle_record_with_source_line(
+                &self,
+                record: &CsvRecord<'_>,
+                source_line_number: usize,
+            ) -> Result<(), ArrowError> {
+                self.0.lock().unwrap().push(OwnedSourceRecord {
+                    line_number: record.line_number,
+                    source_line_number,
+                    byte_offset: record.byte_offset,
+                    record: record.record.to_vec(),
+                });
+                Ok(())
+            }
+        }
+
+        for (columns, csv) in [(1, b"\r\nx\n".as_slice()), (2, b"\r\nx,y\n".as_slice())] {
+            for capacity in [1, 2, 64] {
+                let handler = Arc::new(MaterializedSourceLines::default());
+                let mut decoder = RecordDecoder::new(Reader::new(), columns, false)
+                    .with_initial_source_position(2, 11)
+                    .with_record_error_handler(Some(handler.clone()));
+                let mut reader = BufReader::with_capacity(capacity, Cursor::new(csv));
+                while decoder.len() < 2 {
+                    let buf = reader.fill_buf().unwrap();
+                    let (decoded, bytes) = decoder.decode(buf, 2 - decoder.len()).unwrap();
+                    assert!(bytes > 0 || decoded > 0);
+                    reader.consume(bytes);
+                }
+                let second_raw = if columns == 1 {
+                    b"x\n".as_slice()
+                } else {
+                    b"x,y\n".as_slice()
+                };
+                assert_eq!(
+                    *handler.0.lock().unwrap(),
+                    [
+                        OwnedSourceRecord {
+                            line_number: 1,
+                            source_line_number: 3,
+                            byte_offset: 11,
+                            record: b"\r\n".to_vec(),
+                        },
+                        OwnedSourceRecord {
+                            line_number: 2,
+                            source_line_number: 4,
+                            byte_offset: 13,
+                            record: second_raw.to_vec(),
+                        },
+                    ],
+                    "columns={columns}, capacity={capacity}"
+                );
+            }
         }
     }
 
@@ -2611,8 +3551,7 @@ mod tests {
         });
         let mut decoder =
             RecordDecoder::new(Reader::new(), 1, false).with_record_error_handler(Some(handler));
-        assert_eq!(decoder.decode(b"\r", 1).unwrap(), (1, 1));
-        decoder.flush().unwrap();
+        assert_eq!(decoder.decode(b"\r", 1).unwrap(), (0, 1));
         assert!(
             decoder
                 .decode(b"\n", 1)
@@ -3044,6 +3983,42 @@ mod tests {
             assert_eq!(errors[0].line_number, 2);
             assert_eq!(errors[0].source_line_number, expected_line);
         }
+    }
+
+    #[test]
+    fn test_successful_record_source_lines_after_skipped_prefix() {
+        let csv = b"\"value\ncontinued\",ok\n2,good\n";
+        let handler = Arc::new(SourceLines::default());
+        let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+            .with_initial_source_position(1, 7)
+            .with_record_error_handler(Some(handler.clone()));
+        assert_eq!(decoder.decode(csv, 2).unwrap(), (2, csv.len()));
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            [(1, 2, 7), (2, 4, 7 + b"\"value\ncontinued\",ok\n".len())]
+        );
+    }
+
+    #[test]
+    fn test_successful_record_source_lines_split_crlf_custom_terminator() {
+        let csv = b"1,a\r\nb|2,ok|";
+        let mut builder = csv_core::ReaderBuilder::new();
+        builder.terminator(csv_core::Terminator::Any(b'|'));
+        let handler = Arc::new(SourceLines::default());
+        let mut decoder = RecordDecoder::new(builder.build(), 2, false)
+            .with_ignored_prefix_options(None, Some(b'|'))
+            .with_record_error_handler(Some(handler.clone()));
+        let mut reader = BufReader::with_capacity(1, Cursor::new(csv));
+        while decoder.len() < 2 {
+            let buf = reader.fill_buf().unwrap();
+            let (_, consumed) = decoder.decode(buf, 2 - decoder.len()).unwrap();
+            reader.consume(consumed);
+            if consumed == 0 {
+                break;
+            }
+        }
+        assert_eq!(decoder.len(), 2);
+        assert_eq!(*handler.0.lock().unwrap(), [(1, 1, 0), (2, 2, 7)]);
     }
 
     #[test]
@@ -3584,6 +4559,45 @@ mod tests {
                 elapsed.push(started.elapsed());
             }
             println!("CSV one-column materialize={materialize}: {elapsed:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "focused performance check for opt-in multi-column CSV recovery"]
+    fn bench_multicolumn_blank_as_rows_fast_path() {
+        #[derive(Debug)]
+        struct Noop {
+            materialize: bool,
+        }
+
+        impl CsvRecordErrorHandler for Noop {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                self.materialize
+            }
+        }
+
+        const ROWS: usize = 100_000;
+        let csv = b"1,value\n".repeat(ROWS);
+        for materialize in [false, true] {
+            let handler = Arc::new(Noop { materialize });
+            let mut elapsed = Vec::new();
+            for _ in 0..8 {
+                let mut decoder = RecordDecoder::new(Reader::new(), 2, false)
+                    .with_utf8_preserving_syntax(true)
+                    .with_record_error_handler(Some(handler.clone()));
+                let started = Instant::now();
+                let (rows, bytes) = decoder.decode(&csv, ROWS).unwrap();
+                let records = decoder.flush().unwrap();
+                assert_eq!(rows, ROWS);
+                assert_eq!(bytes, csv.len());
+                assert_eq!(records.len(), ROWS);
+                elapsed.push(started.elapsed());
+            }
+            println!("CSV multi-column materialize={materialize}: {elapsed:?}");
         }
     }
 

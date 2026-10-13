@@ -177,7 +177,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader as StdBufReader, Cursor, Read};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, atomic::AtomicU64};
 
 use crate::map_csv_error;
 use crate::reader::records::{RecordDecoder, StringRecords};
@@ -190,7 +190,8 @@ pub struct CsvRecordError<'a> {
     pub line_number: usize,
     /// One-based physical line containing the start of the malformed record.
     pub source_line_number: usize,
-    /// Zero-based byte offset of the start of the record in the input stream.
+    /// Zero-based byte offset in the supplied input, or in the original source
+    /// when [`ReaderBuilder::with_initial_source_position`] is set.
     pub byte_offset: usize,
     /// Number of fields required by the reader schema.
     pub expected_fields: usize,
@@ -205,7 +206,8 @@ pub struct CsvRecordError<'a> {
 pub struct CsvRecord<'a> {
     /// One-based record number, including any header row.
     pub line_number: usize,
-    /// Zero-based byte offset of the start of the record in the input stream.
+    /// Zero-based byte offset in the supplied input, or in the original source
+    /// when [`ReaderBuilder::with_initial_source_position`] is set.
     pub byte_offset: usize,
     /// Original record bytes, including its record terminator when present.
     pub record: &'a [u8],
@@ -218,7 +220,8 @@ pub struct CsvFilterRecord<'a> {
     pub line_number: usize,
     /// One-based physical line containing the start of the record.
     pub source_line_number: usize,
-    /// Zero-based byte offset of the start of the record in the input stream.
+    /// Zero-based byte offset in the supplied input, or in the original source
+    /// when [`ReaderBuilder::with_initial_source_position`] is set.
     pub byte_offset: usize,
     /// Original record bytes, including its record terminator when present.
     pub record: &'a [u8],
@@ -231,7 +234,8 @@ pub struct CsvInvalidUtf8Error<'a> {
     pub line_number: usize,
     /// One-based physical line containing the start of the malformed record.
     pub source_line_number: usize,
-    /// Zero-based byte offset of the start of the record in the input stream.
+    /// Zero-based byte offset in the supplied input, or in the original source
+    /// when [`ReaderBuilder::with_initial_source_position`] is set.
     pub byte_offset: usize,
     /// Zero-based index of the decoded field containing invalid UTF-8.
     pub field_index: usize,
@@ -263,6 +267,22 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
         Ok(())
     }
 
+    /// Whether successful-record callbacks need the physical source line.
+    fn needs_source_line_number(&self) -> bool {
+        false
+    }
+
+    /// Observe a decoded record with its one-based physical source line.
+    ///
+    /// The default keeps existing handlers compatible with this callback.
+    fn handle_record_with_source_line(
+        &self,
+        record: &CsvRecord<'_>,
+        _source_line_number: usize,
+    ) -> Result<(), ArrowError> {
+        self.handle_record(record)
+    }
+
     /// Opt in to filtering decoded records before they enter a batch.
     fn filters_records(&self) -> bool {
         false
@@ -283,9 +303,8 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
         false
     }
 
-    /// Opt in to treating physical blank lines as empty one-column records.
-    /// This is supported only for a single-column schema. The default reader
-    /// still skips blank lines.
+    /// Opt in to treating physical blank lines as records with empty fields.
+    /// This requires a nonempty schema. The default reader still skips blank lines.
     fn blank_records_are_rows(&self) -> bool {
         false
     }
@@ -299,6 +318,22 @@ pub trait CsvRecordErrorHandler: Debug + Send + Sync {
     fn max_record_bytes(&self) -> Option<usize> {
         None
     }
+}
+
+/// Opt-in handling of physical blank CSV records in the strict decoder.
+///
+/// The default is [`Self::Ignore`], preserving the ordinary CSV scan path.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum CsvBlankRecordPolicy {
+    /// Preserve the CSV parser's default behavior of ignoring blank records.
+    #[default]
+    Ignore,
+    /// Fail when a physical blank record is encountered.
+    Reject,
+    /// Emit one SQL NULL row for a blank record when all source columns are nullable.
+    EmitNullRow,
+    /// Omit blank data records, counting each one in the optional counter.
+    Skip,
 }
 
 /// Order should match [`InferredDataType`]
@@ -1219,6 +1254,9 @@ impl Decoder {
                 validate_header(&rows, self.schema.fields())?;
                 self.header_validation = false;
                 self.to_skip -= 1;
+                if bytes == 0 && !buf.is_empty() {
+                    return self.decode(buf);
+                }
                 return Ok(bytes);
             }
 
@@ -1227,6 +1265,9 @@ impl Decoder {
             let (skipped, bytes) = self.record_decoder.decode_skipping(buf, to_skip)?;
             self.to_skip -= skipped;
             self.record_decoder.clear();
+            if bytes == 0 && skipped > 0 && !buf.is_empty() {
+                return self.decode(buf);
+            }
             return Ok(bytes);
         }
 
@@ -1754,8 +1795,12 @@ pub struct ReaderBuilder {
     projection: Option<Vec<usize>>,
     /// Optional handler for records whose field count differs from the schema.
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
+    blank_record_policy: CsvBlankRecordPolicy,
+    skipped_blank_records_counter: Option<Arc<AtomicU64>>,
     ignore_extra_fields: bool,
     numeric_boolean_values: bool,
+    source_line_offset: usize,
+    source_byte_offset: usize,
 }
 
 impl ReaderBuilder {
@@ -1789,14 +1834,27 @@ impl ReaderBuilder {
             bounds: None,
             projection: None,
             record_error_handler: None,
+            blank_record_policy: CsvBlankRecordPolicy::Ignore,
+            skipped_blank_records_counter: None,
             ignore_extra_fields: false,
             numeric_boolean_values: false,
+            source_line_offset: 0,
+            source_byte_offset: 0,
         }
     }
 
     /// Set whether the CSV file has a header
     pub fn with_header(mut self, has_header: bool) -> Self {
         self.format.header = has_header;
+        self
+    }
+
+    /// Set the physical lines and bytes consumed before the input passed to
+    /// this reader. Record diagnostics retain offsets into the original source;
+    /// record ordinals still begin at one for the supplied input.
+    pub fn with_initial_source_position(mut self, lines: usize, bytes: usize) -> Self {
+        self.source_line_offset = lines;
+        self.source_byte_offset = bytes;
         self
     }
 
@@ -1916,6 +1974,28 @@ impl ReaderBuilder {
         self
     }
 
+    /// Configure strict, no-handler handling of physical blank CSV records.
+    ///
+    /// This option does not change the recovery path selected by
+    /// [`Self::with_record_error_handler`]. `EmitNullRow` requires a nonempty schema
+    /// with all columns nullable and emits missing fields, independent of configured
+    /// null values.
+    pub fn with_blank_record_policy(mut self, policy: CsvBlankRecordPolicy) -> Self {
+        self.blank_record_policy = policy;
+        self
+    }
+
+    /// Count records omitted by [`CsvBlankRecordPolicy::Skip`].
+    ///
+    /// The counter is incremented only for blank records in the data region,
+    /// not for blanks encountered while skipping a header or bounded prefix.
+    /// Input removed before this reader (for example, a physical header skip)
+    /// is likewise not counted.
+    pub fn with_skipped_blank_records_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.skipped_blank_records_counter = Some(counter);
+        self
+    }
+
     /// Replace malformed UTF-8 in decoded CSV fields with U+FFFD.
     /// Disabled by default; malformed batches may allocate replacement data.
     pub fn with_replace_invalid_utf8(mut self, replace: bool) -> Self {
@@ -1949,8 +2029,15 @@ impl ReaderBuilder {
         )
         .with_ignore_extra_fields(self.ignore_extra_fields)
         .with_record_error_handler(self.record_error_handler)
+        .with_blank_record_policy(
+            self.blank_record_policy,
+            !self.schema.fields().is_empty()
+                && self.schema.fields().iter().all(|field| field.is_nullable()),
+            self.skipped_blank_records_counter,
+        )
         .with_replace_invalid_utf8(self.format.replace_invalid_utf8)
         .with_ignored_prefix_options(self.format.comment, self.format.terminator)
+        .with_initial_source_position(self.source_line_offset, self.source_byte_offset)
         .with_utf8_preserving_syntax(
             self.format.delimiter.is_none_or(|byte| byte.is_ascii())
                 && self.format.quote.is_none_or(|byte| byte.is_ascii())
@@ -1994,6 +2081,85 @@ impl ReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct CaptureSourcePositions(Mutex<Vec<(usize, usize, usize)>>);
+
+    impl CsvRecordErrorHandler for CaptureSourcePositions {
+        fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            self.0.lock().unwrap().push((
+                error.line_number,
+                error.source_line_number,
+                error.byte_offset,
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_reader_initial_source_position_preserves_original_diagnostics() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let positions = Arc::new(CaptureSourcePositions::default());
+        let reader = ReaderBuilder::new(schema)
+            .with_header(false)
+            .with_initial_source_position(1, 8)
+            .with_record_error_handler(positions.clone())
+            .build("1,bad,extra\n2,ok\n".as_bytes())
+            .unwrap();
+        let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1
+        );
+        assert_eq!(*positions.0.lock().unwrap(), [(1, 2, 8)]);
+
+        let positions = Arc::new(CaptureSourcePositions::default());
+        let reader = ReaderBuilder::new(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ])))
+        .with_initial_source_position(2, 10)
+        .with_record_error_handler(positions.clone())
+        .build("1,bad,extra\n".as_bytes())
+        .unwrap();
+        reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(*positions.0.lock().unwrap(), [(1, 3, 10)]);
+    }
+
+    #[test]
+    fn test_positioned_reader_handles_bom_and_large_line_offset() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let prefix = b"\xef\xbb\xbf# comment\n1,ok\n";
+        let positions = Arc::new(CaptureSourcePositions::default());
+        let reader = ReaderBuilder::new(schema.clone())
+            .with_comment(b'#')
+            .with_initial_source_position(1, 8)
+            .with_record_error_handler(positions.clone())
+            .build(b"\xef\xbb\xbf# comment\n1,ok\n2,extra,value\n".as_slice())
+            .unwrap();
+        reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let positions = positions.0.lock().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].1, 4);
+        assert_eq!(positions[0].2, 8 + prefix.len());
+        drop(positions);
+
+        let positions = Arc::new(CaptureSourcePositions::default());
+        let reader = ReaderBuilder::new(schema)
+            .with_initial_source_position(usize::MAX, 0)
+            .with_record_error_handler(positions.clone())
+            .build("1,bad,extra\n".as_bytes())
+            .unwrap();
+        reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(*positions.0.lock().unwrap(), [(1, usize::MAX, 0)]);
+    }
 
     #[derive(Debug)]
     struct SkipMalformed;
@@ -2006,6 +2172,641 @@ mod tests {
         fn handle_invalid_utf8(&self, _error: &CsvInvalidUtf8Error<'_>) -> Result<(), ArrowError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_multicolumn_blank_record_materializes_null_fields() {
+        #[derive(Debug)]
+        struct BlankRows;
+
+        impl CsvRecordErrorHandler for BlankRows {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                true
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = ReaderBuilder::new(schema)
+            .with_record_error_handler(Arc::new(BlankRows))
+            .build(Cursor::new(b"1,a\n\n2,b\n"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert!(batch.column(0).is_null(1));
+        assert!(batch.column(1).is_null(1));
+    }
+
+    #[test]
+    fn test_strict_blank_rejects_cr_lf_crlf_across_chunks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        for input in [
+            b"1,a\n\n2,b\n".as_slice(),
+            b"1,a\r\r2,b\r",
+            b"1,a\r\n\r\n2,b\r\n",
+        ] {
+            for capacity in 1..=4 {
+                let buffered = StdBufReader::with_capacity(capacity, Cursor::new(input));
+                let error = ReaderBuilder::new(Arc::clone(&schema))
+                    .with_blank_record_policy(CsvBlankRecordPolicy::Reject)
+                    .build_buffered(buffered)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("blank CSV record at line 2"),
+                    "{input:?}, capacity={capacity}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_ignores_quoted_newlines() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Utf8, true),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        for capacity in 1..=4 {
+            let buffered =
+                StdBufReader::with_capacity(capacity, Cursor::new(b"\"a\n\nb\",x\r\nnext,y\r\n"));
+            let batches = ReaderBuilder::new(Arc::clone(&schema))
+                .with_blank_record_policy(CsvBlankRecordPolicy::Reject)
+                .build_buffered(buffered)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+            assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "a\n\nb");
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_emits_missing_field_independent_of_null_values() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for separator in ["\n", "\r", "\r\n"] {
+            let input = format!("alpha{separator}{separator}\"\"{separator}");
+            for capacity in 1..=4 {
+                let buffered = StdBufReader::with_capacity(capacity, Cursor::new(input.as_bytes()));
+                let batches = ReaderBuilder::new(Arc::clone(&schema))
+                    .with_blank_record_policy(CsvBlankRecordPolicy::EmitNullRow)
+                    .with_null_values(vec!["NULL".to_owned()])
+                    .with_preserve_quoted_empty(true)
+                    .build_buffered(buffered)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(rows, 3, "{separator:?}, capacity={capacity}");
+                let values = batches[0].column(0).as_string::<i32>();
+                assert_eq!(values.value(0), "alpha");
+                assert!(values.is_null(1));
+                assert!(!values.is_null(2));
+                assert_eq!(values.value(2), "");
+            }
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_skip_counts_only_physical_blanks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        for capacity in 1..=4 {
+            let counter = Arc::new(AtomicU64::new(0));
+            let buffered =
+                StdBufReader::with_capacity(capacity, Cursor::new(b"1,a\n\n\r\n2,b\r\n"));
+            let batches = ReaderBuilder::new(Arc::clone(&schema))
+                .with_blank_record_policy(CsvBlankRecordPolicy::Skip)
+                .with_skipped_blank_records_counter(Arc::clone(&counter))
+                .build_buffered(buffered)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_emit_null_requires_nullable_columns() {
+        for schema in [
+            Schema::new(vec![Field::new("value", DataType::Utf8, false)]),
+            Schema::new(vec![
+                Field::new("first", DataType::Utf8, true),
+                Field::new("second", DataType::Utf8, false),
+            ]),
+        ] {
+            let error = ReaderBuilder::new(Arc::new(schema))
+                .with_blank_record_policy(CsvBlankRecordPolicy::EmitNullRow)
+                .build(Cursor::new(b"\n"))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("require all columns to be nullable")
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_emits_all_null_source_fields() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Int64, true),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        for separator in ["\n", "\r", "\r\n"] {
+            let input = format!("{separator}1,alpha{separator}2,\"\"{separator}");
+            for capacity in 1..=4 {
+                let batches = ReaderBuilder::new(Arc::clone(&schema))
+                    .with_blank_record_policy(CsvBlankRecordPolicy::EmitNullRow)
+                    .with_null_values(vec!["sentinel".to_owned()])
+                    .with_preserve_quoted_empty(true)
+                    .with_batch_size(1)
+                    .build_buffered(StdBufReader::with_capacity(
+                        capacity,
+                        Cursor::new(input.as_bytes()),
+                    ))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(batches.len(), 3, "{separator:?}, capacity={capacity}");
+                assert!(batches[0].column(0).is_null(0));
+                assert!(batches[0].column(1).is_null(0));
+                assert_eq!(batches[1].column(0).as_primitive::<Int64Type>().value(0), 1);
+                assert_eq!(batches[1].column(1).as_string::<i32>().value(0), "alpha");
+                assert!(!batches[2].column(1).is_null(0));
+                assert_eq!(batches[2].column(1).as_string::<i32>().value(0), "");
+            }
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_skip_with_bom_comments_and_header() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let counter = Arc::new(AtomicU64::new(0));
+        let batches = ReaderBuilder::new(schema)
+            .with_header(true)
+            .with_comment(b'#')
+            .with_blank_record_policy(CsvBlankRecordPolicy::Skip)
+            .with_skipped_blank_records_counter(Arc::clone(&counter))
+            .build(Cursor::new(
+                b"\xef\xbb\xbfid,value\n#ignored\n\n1,a\n\n2,b\n",
+            ))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_strict_blank_validated_crlf_header_across_chunks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        for capacity in 1..=4 {
+            let batches = ReaderBuilder::new(Arc::clone(&schema))
+                .with_header(true)
+                .with_header_validation(true)
+                .with_blank_record_policy(CsvBlankRecordPolicy::Reject)
+                .build_buffered(StdBufReader::with_capacity(
+                    capacity,
+                    Cursor::new(b"id,value\r\n1,a\r\n"),
+                ))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_split_bom_validated_header_and_blank() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        for capacity in 1..=4 {
+            let error = ReaderBuilder::new(Arc::clone(&schema))
+                .with_header(true)
+                .with_header_validation(true)
+                .with_blank_record_policy(CsvBlankRecordPolicy::Reject)
+                .build_buffered(StdBufReader::with_capacity(
+                    capacity,
+                    Cursor::new(b"\xef\xbb\xbfid,value\r\n\r\n1,a\r\n"),
+                ))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("blank CSV record at line 2"),
+                "capacity={capacity}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_split_bom_preserves_second_bom() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for capacity in 1..=4 {
+            let batches = ReaderBuilder::new(Arc::clone(&schema))
+                .with_blank_record_policy(CsvBlankRecordPolicy::Reject)
+                .build_buffered(StdBufReader::with_capacity(
+                    capacity,
+                    Cursor::new(b"\xef\xbb\xbf\xef\xbb\xbfvalue\n"),
+                ))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(
+                batches[0].column(0).as_string::<i32>().value(0),
+                "\u{feff}value"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_split_bom_before_blank_and_at_eof() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for capacity in 1..=4 {
+            for ending in ["\n", "\r", "\r\n"] {
+                let input = format!("\u{feff}{ending}value{ending}");
+                let counter = Arc::new(AtomicU64::new(0));
+                let batches = ReaderBuilder::new(Arc::clone(&schema))
+                    .with_blank_record_policy(CsvBlankRecordPolicy::Skip)
+                    .with_skipped_blank_records_counter(Arc::clone(&counter))
+                    .build_buffered(StdBufReader::with_capacity(
+                        capacity,
+                        Cursor::new(input.as_bytes()),
+                    ))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "value");
+                assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+            }
+            let batches = ReaderBuilder::new(Arc::clone(&schema))
+                .with_blank_record_policy(CsvBlankRecordPolicy::Reject)
+                .build_buffered(StdBufReader::with_capacity(
+                    capacity,
+                    Cursor::new(b"\xef\xbb\xbf"),
+                ))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(batches.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_split_bom_before_comment() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for capacity in 1..=4 {
+            let batches = ReaderBuilder::new(Arc::clone(&schema))
+                .with_comment(b'#')
+                .with_blank_record_policy(CsvBlankRecordPolicy::Reject)
+                .build_buffered(StdBufReader::with_capacity(
+                    capacity,
+                    Cursor::new(b"\xef\xbb\xbf#comment\nvalue\n"),
+                ))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "value");
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_fast_path_split_crlf_and_quoted_newline() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for capacity in 1..=4 {
+            let counter = Arc::new(AtomicU64::new(0));
+            let batches = ReaderBuilder::new(Arc::clone(&schema))
+                .with_batch_size(1)
+                .with_blank_record_policy(CsvBlankRecordPolicy::Skip)
+                .with_skipped_blank_records_counter(Arc::clone(&counter))
+                .build_buffered(StdBufReader::with_capacity(
+                    capacity,
+                    Cursor::new(b"\"one\r\ntwo\"\r\nthree\r\n\r\nfour\r\n"),
+                ))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let values: Vec<_> = batches
+                .iter()
+                .map(|batch| batch.column(0).as_string::<i32>().value(0))
+                .collect();
+            assert_eq!(values, ["one\r\ntwo", "three", "four"]);
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_fast_path_preserves_source_line() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for input in [
+            b"\"a\r\nb\"\r\nvalue\r\n\r\n".as_slice(),
+            b"\"a\rb\"\r\nvalue\r\n\r\n",
+        ] {
+            for capacity in [1, 2, 4, 64] {
+                let error = ReaderBuilder::new(Arc::clone(&schema))
+                    .with_batch_size(1)
+                    .with_blank_record_policy(CsvBlankRecordPolicy::Reject)
+                    .build_buffered(StdBufReader::with_capacity(capacity, Cursor::new(input)))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("source line 4"),
+                    "input={input:?}, capacity={capacity}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_skip_counter_excludes_skipped_header_and_bounds() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for capacity in 1..=4 {
+            let counter = Arc::new(AtomicU64::new(0));
+            let batches = ReaderBuilder::new(Arc::clone(&schema))
+                .with_header(true)
+                .with_bounds(1, 2)
+                .with_blank_record_policy(CsvBlankRecordPolicy::Skip)
+                .with_skipped_blank_records_counter(Arc::clone(&counter))
+                .build_buffered(StdBufReader::with_capacity(
+                    capacity,
+                    Cursor::new(b"\nheader\n\nignored\n\nvalue\n"),
+                ))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "value");
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_skip_counter_excludes_pre_header_blanks_with_validation() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for validate_header in [false, true] {
+            for separator in ["\n", "\r", "\r\n"] {
+                let input =
+                    format!("{separator}{separator}value{separator}{separator}alpha{separator}");
+                for capacity in 1..=4 {
+                    let counter = Arc::new(AtomicU64::new(0));
+                    let batches = ReaderBuilder::new(Arc::clone(&schema))
+                        .with_header(true)
+                        .with_header_validation(validate_header)
+                        .with_blank_record_policy(CsvBlankRecordPolicy::Skip)
+                        .with_skipped_blank_records_counter(Arc::clone(&counter))
+                        .build_buffered(StdBufReader::with_capacity(
+                            capacity,
+                            Cursor::new(input.as_bytes()),
+                        ))
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                    assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "alpha");
+                    assert_eq!(
+                        counter.load(std::sync::atomic::Ordering::Relaxed),
+                        1,
+                        "validate_header={validate_header}, separator={separator:?}, capacity={capacity}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_strict_blank_batch_boundary_and_trailing_cr() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let batches = ReaderBuilder::new(schema)
+            .with_batch_size(1)
+            .with_blank_record_policy(CsvBlankRecordPolicy::EmitNullRow)
+            .build_buffered(StdBufReader::with_capacity(1, Cursor::new(b"a\r\n\r\nb\r")))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 3);
+        assert!(!batches[0].column(0).is_null(0));
+        assert!(batches[1].column(0).is_null(0));
+        assert!(!batches[2].column(0).is_null(0));
+    }
+
+    #[test]
+    fn test_strict_blank_skip_preserves_following_field_count_line() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let error = ReaderBuilder::new(schema)
+            .with_blank_record_policy(CsvBlankRecordPolicy::Skip)
+            .build(Cursor::new(b"1,a\n\nbad\n"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_err();
+        assert!(error.to_string().contains("line 3"), "{error}");
+    }
+
+    #[test]
+    fn test_default_strict_reader_still_ignores_blank_lines() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batches = ReaderBuilder::new(schema)
+            .build(Cursor::new(b"1,a\n\n2,b\n"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    }
+
+    #[test]
+    #[ignore = "local strict CSV blank-policy throughput benchmark"]
+    fn bench_strict_blank_record_policies() {
+        const ROWS: usize = 200_000;
+        const BLANK_INTERVAL: usize = 10_000;
+        const REPETITIONS: usize = 5;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        for ending in ["\n", "\r\n"] {
+            let row = format!("some-long-value{ending}");
+            for sparse in [false, true] {
+                let mut input = Vec::with_capacity(
+                    ROWS * row.len() + usize::from(sparse) * (ROWS / BLANK_INTERVAL) * ending.len(),
+                );
+                for i in 0..ROWS {
+                    input.extend_from_slice(row.as_bytes());
+                    if sparse && (i + 1) % BLANK_INTERVAL == 0 {
+                        input.extend_from_slice(ending.as_bytes());
+                    }
+                }
+                let blanks = if sparse { ROWS / BLANK_INTERVAL } else { 0 };
+                for policy in [
+                    CsvBlankRecordPolicy::Ignore,
+                    CsvBlankRecordPolicy::Reject,
+                    CsvBlankRecordPolicy::EmitNullRow,
+                    CsvBlankRecordPolicy::Skip,
+                ] {
+                    let mut times = Vec::with_capacity(REPETITIONS);
+                    for _ in 0..REPETITIONS {
+                        let counter = Arc::new(AtomicU64::new(0));
+                        let mut builder = ReaderBuilder::new(Arc::clone(&schema))
+                            .with_batch_size(8192)
+                            .with_null_values(vec!["NULL".to_owned()]);
+                        if policy != CsvBlankRecordPolicy::Ignore {
+                            builder = builder.with_blank_record_policy(policy);
+                        }
+                        if policy == CsvBlankRecordPolicy::Skip {
+                            builder =
+                                builder.with_skipped_blank_records_counter(Arc::clone(&counter));
+                        }
+                        let started = std::time::Instant::now();
+                        let result = builder
+                            .build(Cursor::new(input.as_slice()))
+                            .unwrap()
+                            .collect::<Result<Vec<_>, _>>();
+                        times.push(started.elapsed());
+                        if policy == CsvBlankRecordPolicy::Reject && sparse {
+                            assert!(
+                                result
+                                    .unwrap_err()
+                                    .to_string()
+                                    .contains("blank CSV record at line")
+                            );
+                        } else {
+                            let loaded: usize =
+                                result.unwrap().iter().map(RecordBatch::num_rows).sum();
+                            assert_eq!(
+                                loaded,
+                                ROWS + usize::from(policy == CsvBlankRecordPolicy::EmitNullRow)
+                                    * blanks
+                            );
+                        }
+                        if policy == CsvBlankRecordPolicy::Skip {
+                            assert_eq!(
+                                counter.load(std::sync::atomic::Ordering::Relaxed),
+                                blanks as u64
+                            );
+                        }
+                    }
+                    times.sort_unstable();
+                    let median = times[REPETITIONS / 2].as_secs_f64();
+                    let (bytes, rows) = if policy == CsvBlankRecordPolicy::Reject && sparse {
+                        (BLANK_INTERVAL * row.len() + ending.len(), BLANK_INTERVAL)
+                    } else {
+                        (input.len(), ROWS)
+                    };
+                    println!(
+                        "strict blank policy={policy:?} ending={ending:?} sparse={sparse}: {:.1} MiB/s, {:.2} Mrows/s (median {median:.3}s)",
+                        bytes as f64 / median / (1024.0 * 1024.0),
+                        rows as f64 / median / 1_000_000.0,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_split_cr_blank_header_does_not_hide_first_data_row() {
+        #[derive(Debug)]
+        struct BlankRows;
+
+        impl CsvRecordErrorHandler for BlankRows {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                true
+            }
+        }
+
+        for validate in [false, true] {
+            let field_name = if validate { "" } else { "value" };
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                field_name,
+                DataType::Utf8,
+                true,
+            )]));
+            let input = std::io::BufReader::with_capacity(1, Cursor::new(b"\rX\n"));
+            let batches = ReaderBuilder::new(schema)
+                .with_header(true)
+                .with_header_validation(validate)
+                .with_record_error_handler(Arc::new(BlankRows))
+                .build_buffered(input)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.len(), 1, "validate={validate}");
+            assert_eq!(batches[0].num_rows(), 1);
+            assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "X");
+        }
+    }
+
+    #[test]
+    fn test_multicolumn_blank_record_preserves_quoted_empty_across_crlf_chunks() {
+        #[derive(Debug)]
+        struct BlankRows;
+
+        impl CsvRecordErrorHandler for BlankRows {
+            fn handle(&self, _error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+                Ok(())
+            }
+
+            fn blank_records_are_rows(&self) -> bool {
+                true
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Utf8, true),
+            Field::new("second", DataType::Utf8, true),
+        ]));
+        let input = std::io::BufReader::with_capacity(1, Cursor::new(b"\"\",x\r\n\r\nz,\"\"\r\n"));
+        let batch = ReaderBuilder::new(schema)
+            .with_preserve_quoted_empty(true)
+            .with_record_error_handler(Arc::new(BlankRows))
+            .build_buffered(input)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        let first = batch.column(0).as_string::<i32>();
+        let second = batch.column(1).as_string::<i32>();
+        assert!(!first.is_null(0));
+        assert_eq!(first.value(0), "");
+        assert!(first.is_null(1));
+        assert!(second.is_null(1));
+        assert!(!second.is_null(2));
+        assert_eq!(second.value(2), "");
     }
 
     #[test]
