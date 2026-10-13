@@ -65,6 +65,7 @@ fn count_source_line_breaks(raw: &[u8]) -> usize {
 
 #[derive(Clone, Copy, Debug)]
 struct SourceLineCounter {
+    initial_line_offset: usize,
     lf_count: usize,
     count_lf_independently: bool,
     bare_cr_count: usize,
@@ -104,7 +105,9 @@ impl SourceLineCounter {
             .saturating_add(usize::from(
                 self.pending_cr && record.last() == Some(&b'\r'),
             ));
-        end_line.saturating_sub(count_source_line_breaks(record))
+        end_line
+            .saturating_sub(count_source_line_breaks(record))
+            .saturating_add(self.initial_line_offset)
     }
 }
 
@@ -328,6 +331,7 @@ impl RecordDecoder {
             max_record_bytes: None,
             replace_invalid_utf8: false,
             source_lines: SourceLineCounter {
+                initial_line_offset: 0,
                 lf_count: 0,
                 count_lf_independently: true,
                 bare_cr_count: 0,
@@ -344,6 +348,18 @@ impl RecordDecoder {
             record_data_start: 0,
             record_offsets_start: 1,
         }
+    }
+
+    pub(crate) fn with_initial_source_position(
+        mut self,
+        skipped_lines: usize,
+        skipped_bytes: usize,
+    ) -> Self {
+        self.line_number = skipped_lines.saturating_add(1);
+        self.source_lines.initial_line_offset = skipped_lines;
+        self.stream_offset = skipped_bytes;
+        self.record_byte_offset = skipped_bytes;
+        self
     }
 
     pub fn with_ignore_extra_fields(mut self, ignore: bool) -> Self {

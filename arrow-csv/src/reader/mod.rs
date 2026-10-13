@@ -1739,6 +1739,8 @@ pub struct ReaderBuilder {
     record_error_handler: Option<Arc<dyn CsvRecordErrorHandler>>,
     ignore_extra_fields: bool,
     numeric_boolean_values: bool,
+    source_line_offset: usize,
+    source_byte_offset: usize,
 }
 
 impl ReaderBuilder {
@@ -1774,12 +1776,22 @@ impl ReaderBuilder {
             record_error_handler: None,
             ignore_extra_fields: false,
             numeric_boolean_values: false,
+            source_line_offset: 0,
+            source_byte_offset: 0,
         }
     }
 
     /// Set whether the CSV file has a header
     pub fn with_header(mut self, has_header: bool) -> Self {
         self.format.header = has_header;
+        self
+    }
+
+    /// Set the physical lines and bytes consumed before the input passed to
+    /// this reader. Record diagnostics retain offsets into the original source.
+    pub fn with_initial_source_position(mut self, lines: usize, bytes: usize) -> Self {
+        self.source_line_offset = lines;
+        self.source_byte_offset = bytes;
         self
     }
 
@@ -1934,6 +1946,7 @@ impl ReaderBuilder {
         .with_record_error_handler(self.record_error_handler)
         .with_replace_invalid_utf8(self.format.replace_invalid_utf8)
         .with_ignored_prefix_options(self.format.comment, self.format.terminator)
+        .with_initial_source_position(self.source_line_offset, self.source_byte_offset)
         .with_utf8_preserving_syntax(
             self.format.delimiter.is_none_or(|byte| byte.is_ascii())
                 && self.format.quote.is_none_or(|byte| byte.is_ascii())
@@ -1964,8 +1977,8 @@ impl ReaderBuilder {
             to_skip: start,
             header_validation: self.format.header && self.format.header_validation,
             record_decoder,
-            line_number: start,
-            end,
+            line_number: start.saturating_add(self.source_line_offset),
+            end: end.saturating_add(self.source_line_offset),
             projection: self.projection,
             batch_size: self.batch_size,
             null_regex: self.format.null_regex,
@@ -1977,6 +1990,42 @@ impl ReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct CaptureSourcePositions(Mutex<Vec<(usize, usize, usize)>>);
+
+    impl CsvRecordErrorHandler for CaptureSourcePositions {
+        fn handle(&self, error: &CsvRecordError<'_>) -> Result<(), ArrowError> {
+            self.0.lock().unwrap().push((
+                error.line_number,
+                error.source_line_number,
+                error.byte_offset,
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_reader_initial_source_position_preserves_original_diagnostics() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let positions = Arc::new(CaptureSourcePositions::default());
+        let reader = ReaderBuilder::new(schema)
+            .with_header(false)
+            .with_initial_source_position(1, 8)
+            .with_record_error_handler(positions.clone())
+            .build("1,bad,extra\n2,ok\n".as_bytes())
+            .unwrap();
+        let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1
+        );
+        assert_eq!(*positions.0.lock().unwrap(), [(2, 2, 8)]);
+    }
 
     #[derive(Debug)]
     struct SkipMalformed;
