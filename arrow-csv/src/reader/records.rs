@@ -2178,7 +2178,7 @@ mod tests {
             }
         }
 
-        const ROWS: usize = 100_000;
+        const ROWS: usize = 1_000_000;
         let csv = row.repeat(ROWS);
         let handler = Arc::new(Noop { source_lines });
         let mut elapsed = Vec::new();
